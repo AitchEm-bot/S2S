@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mindful Journal & Chat</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            overflow-x: hidden;
+        }
+
+        #background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(135deg, #e6f2ff, #b3d9ff, #66b3ff);
+            z-index: -1;
+            transition: background 2s ease;
+        }
+
+        .tab-container {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 8px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+        }
+
+        .tab {
+            padding: 8px 20px;
+            border: none;
+            border-radius: 15px;
+            background: transparent;
+            color: #003366;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+
+        .tab.active {
+            background: white;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .content {
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        #chatContainer {
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 20px;
+            padding: 20px;
+            width: 80%;
+            margin: auto;
+            max-width: 500px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        #chatMessages {
+            height: 300px;
+            overflow-y: auto;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .message {
+            padding: 10px 15px;
+            border-radius: 15px;
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+
+        .user-message {
+            background: #003366;
+            color: white;
+            align-self: flex-end;
+        }
+
+        .bot-message {
+            background: #e6f2ff;
+            color: #003366;
+            align-self: flex-start;
+        }
+
+        #chatInput {
+            display: flex;
+            gap: 10px;
+        }
+
+        #messageInput {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 20px;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        #messageInput:focus {
+            outline: none;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+        }
+
+        #sendButton {
+            background: #003366;
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+
+        #sendButton:hover {
+            transform: scale(1.1);
+            background: #004080;
+        }
+
+        #chatMessages::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        #chatMessages::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.1);
+            border-radius: 3px;
+        }
+
+        #chatMessages::-webkit-scrollbar-thumb {
+            background: rgba(0, 51, 102, 0.2);
+            border-radius: 3px;
+        }
+
+        #chatMessages::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 51, 102, 0.4);
+        }
+
+        #recordButton {
+            background-color: #ffffff;
+            border: none;
+            border-radius: 50%;
+            width: 80px;
+            height: 80px;
+            cursor: pointer;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        #recordButton:hover {
+            transform: scale(1.1);
+            box-shadow: 0 6px 8px rgba(0, 0, 0, 0.2);
+        }
+
+        #recordButton svg {
+            width: 40px;
+            height: 40px;
+            fill: #003366;
+            transition: fill 0.3s ease;
+        }
+
+        footer {
+            text-align: center;
+            padding: 10px;
+            color: #003366;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="background"></div>
+    
+    <nav class="tab-container">
+        <button class="tab" onclick="location.href='/'">Record</button>
+        <button class="tab active" onclick="location.href='/chat'">Chat</button>
+    </nav>
+
+    <main class="content">
+        <div id="recordContent" style="display: none;">
+            <button id="recordButton">
+                <svg viewBox="0 0 24 24">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
+                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+                </svg>
+            </button>
+        </div>
+
+        <div id="chatContent">
+            <div id="chatContainer">
+                <button id="resetButton" style="
+                    background: #003366;
+                    color: white;
+                    border: none;
+                    border-radius: 15px;
+                    padding: 8px 16px;
+                    cursor: pointer;
+                    margin-bottom: 10px;
+                ">Reset Conversation</button>
+                <div id="chatMessages" style="height: 300px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; margin-bottom: 10px;">
+                    <div class="message bot-message">How are you feeling today? Let's have a mindful conversation.</div>
+                </div>
+                <div id="chatInput">
+                    <input type="text" id="messageInput" placeholder="Type your message..." style="width: 80%; padding: 5px;">
+                    <button id="sendButton">
+                        <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
+                            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <p>Mindful Journal & Chat © 2025 | Nurture your thoughts, cultivate peace</p>
+    </footer>
+
+    <script>
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.getElementById('recordContent').style.display = 'none';
+            document.getElementById('chatContent').style.display = 'none';
+            
+            if (tab === 'record') {
+                document.querySelector('.tab:first-child').classList.add('active');
+                document.getElementById('recordContent').style.display = 'block';
+            } else {
+                document.querySelector('.tab:last-child').classList.add('active');
+                document.getElementById('chatContent').style.display = 'block';
+            }
+        }
+
+        const chatMessages = document.getElementById('chatMessages');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+
+        async function loadChatHistory() {
+            try {
+                const response = await fetch('http://127.0.0.1:9999/get_chat_history');
+                const data = await response.json();
+                
+                // Only clear and add welcome message if there's no history
+                if (data.history.length === 0) {
+                    chatMessages.innerHTML = '<div class="message bot-message">How are you feeling today? Let\'s have a mindful conversation.</div>';
+                } else {
+                    // Clear existing messages
+                    chatMessages.innerHTML = '';
+                    
+                    // Add each message from history, excluding transcriptions
+                    data.history.forEach(msg => {
+                        // Only show messages that were part of the chat interaction
+                        if (msg.source !== 'transcription') {
+                            addMessageToChat(msg.content, msg.role === "user");
+                        }
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading chat history:', error);
+                addMessageToChat('Error loading chat history');
+            }
+        }
+
+        // Load chat history when page loads
+        loadChatHistory();
+
+        function addMessageToChat(message, isUser = false) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            messageDiv.textContent = message;
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+
+            // Add user message to chat
+            addMessageToChat(message, true);
+            messageInput.value = '';
+
+            try {
+                const response = await fetch('http://127.0.0.1:9999/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ message: message })
+                });
+
+                const data = await response.json();
+                
+                // Add bot response to chat
+                if (data.response) {
+                    addMessageToChat(data.response);
+                } else if (data.error) {
+                    addMessageToChat(`Error: ${data.error}`);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                addMessageToChat('Error: Could not connect to the server');
+            }
+        }
+
+        // Event listeners
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        document.getElementById('resetButton').addEventListener('click', async function() {
+            try {
+                const response = await fetch('http://127.0.0.1:9999/reset_context', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                // Clear the chat messages UI and add welcome message
+                const chatMessages = document.getElementById('chatMessages');
+                chatMessages.innerHTML = '<div class="message bot-message">Context has been reset. How can I help you?</div>';
+                
+                // Ensure the container maintains its size
+                chatMessages.style.height = '300px';
+                chatMessages.style.border = '1px solid #ccc';
+                chatMessages.style.overflowY = 'scroll';
+                chatMessages.style.padding = '10px';
+                chatMessages.style.marginBottom = '10px';
+                
+            } catch (error) {
+                console.error('Error:', error);
+                addMessageToChat('Error: Could not reset context');
+            }
+        });
+    </script>
+</body>
+</html>

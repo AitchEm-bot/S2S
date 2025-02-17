@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Recorder</title>
+</head>
+<body>
+    <h1>Record and Send Audio</h1>
+    
+    <label for="filename">Enter Filename (optional): </label>
+    <input type="text" id="filename" placeholder="recording">
+    <br><br>
+    
+    <button id="recordButton">Start Recording</button>
+    <p id="status">Press the button to record.</p>
+    
+    <!-- Add this div for displaying responses -->
+    <div id="responses">
+        <p><strong>Transcription:</strong> <span id="transcription"></span></p>
+        <p><strong>Ollama Response:</strong> <span id="ollama-response"></span></p>
+    </div>
+
+    <!-- Add chat interface -->
+    <div id="chat-interface" style="margin-top: 20px;">
+        <h2>Chat with Ollama</h2>
+        <div id="chat-history" style="height: 300px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; margin-bottom: 10px;"></div>
+        <input type="text" id="chat-input" placeholder="Type your message..." style="width: 80%; padding: 5px;">
+        <button id="send-button">Send</button>
+    </div>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        document.getElementById("recordButton").addEventListener("click", async function () {
+            if (!isRecording) {
+                // Start Recording
+                let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+
+                mediaRecorder.onstop = async () => {
+                    let audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+                    let formData = new FormData();
+
+                    // Get the filename from input or use default
+                    let filenameInput = document.getElementById("filename").value.trim();
+                    // let filename = filenameInput ? filenameInput + ".wav" : "recording.wav";
+                    let filename = filenameInput + ".wav";
+
+                    formData.append("audio", audioBlob, filename);
+
+                    document.getElementById("status").innerText = "Uploading...";
+
+                    // Send to backend
+                    fetch("http://127.0.0.1:9999/listen_audio", {
+                        method: "POST",
+                        body: formData
+                    })
+                    .then(response => response.json())  // Change to json()
+                    .then(data => {
+                        document.getElementById("status").innerText = "Audio processed!";
+                        document.getElementById("transcription").innerText = data.transcription;
+                        document.getElementById("ollama-response").innerText = data.ollama_response;
+                    })
+                    .catch(error => {
+                        document.getElementById("status").innerText = "Error processing audio!";
+                        console.error(error);
+                    });
+
+                    audioChunks = [];
+                };
+
+                mediaRecorder.start();
+                document.getElementById("recordButton").innerText = "Stop Recording";
+                document.getElementById("status").innerText = "Recording...";
+                isRecording = true;
+            } else {
+                // Stop Recording
+                mediaRecorder.stop();
+                document.getElementById("recordButton").innerText = "Start Recording";
+                isRecording = false;
+            }
+        });
+    </script>
+</body>
+</html>

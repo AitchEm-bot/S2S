@@ -7,6 +7,8 @@ class OllamaChat:
         self.base_url = "http://localhost:11434/api"
         self.context = []
         
+
+    
     def add_to_context(self, text):
         """Add transcribed text to context"""
         self.context.append({

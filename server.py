@@ -9,6 +9,8 @@ transcribe_audio = handlers.transcribe_audio
 app = Flask(__name__)
 CORS(app)
 
+
+
 integer_list = []
 
 UPLOAD_FOLDER = "uploads"
@@ -16,6 +18,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Initialize Ollama chat
 ollama_chat = OllamaChat()
+ollama_chat.preload_model()
 
 def new_int_name():
     for name in os.listdir("uploads"):

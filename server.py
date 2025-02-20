@@ -1,10 +1,11 @@
 from flask import Flask, request, render_template
 import os
-from transcribe import transcribe_audio
+from handling import handlers
 from flask_cors import CORS
-from saving import save_text_to_file
 from ollama import OllamaChat
 
+save_text_to_file = handlers.save_text_to_file
+transcribe_audio = handlers.transcribe_audio
 app = Flask(__name__)
 CORS(app)
 

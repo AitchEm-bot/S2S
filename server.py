@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template, Response, stream_with_context
+from flask import Flask, request, render_template, Response, stream_with_context, jsonify
 import os
 from handling import handlers
 from flask_cors import CORS
@@ -121,7 +121,10 @@ def reset_context():
 
 @app.route("/get_chat_history")
 def get_chat_history():
-    return {"history": ollama_chat.context}
+    """Return the chat history"""
+    return jsonify({
+        "history": ollama_chat.context
+    })
 
 if __name__ == "__main__":
     app.run(debug=True, port=9999, host="0.0.0.0")

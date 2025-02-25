@@ -194,6 +194,48 @@
             color: #003366;
             font-size: 12px;
         }
+
+        #resetButton {
+            background: #003366;
+            color: white;
+            border: none;
+            border-radius: 15px;
+            padding: 8px 16px;
+            cursor: pointer;
+            margin-bottom: 10px;
+            transition: background-color 0.3s ease;
+        }
+
+        #resetButton:hover {
+            background: #004080;
+        }
+
+        .loading-dots {
+            display: inline-block;
+        }
+
+        .loading-dots span {
+            animation: loading 1.4s infinite ease-in-out both;
+            background-color: #003366;
+            border-radius: 50%;
+            display: inline-block;
+            height: 5px;
+            width: 5px;
+            margin: 0 2px;
+        }
+
+        .loading-dots span:nth-child(1) {
+            animation-delay: -0.32s;
+        }
+
+        .loading-dots span:nth-child(2) {
+            animation-delay: -0.16s;
+        }
+
+        @keyframes loading {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
     </style>
 </head>
 <body>
@@ -216,20 +258,12 @@
 
         <div id="chatContent">
             <div id="chatContainer">
-                <button id="resetButton" style="
-                    background: #003366;
-                    color: white;
-                    border: none;
-                    border-radius: 15px;
-                    padding: 8px 16px;
-                    cursor: pointer;
-                    margin-bottom: 10px;
-                ">Reset Conversation</button>
-                <div id="chatMessages" style="height: 300px; border: 1px solid #ccc; overflow-y: scroll; padding: 10px; margin-bottom: 10px;">
+                <button id="resetButton">Reset Conversation</button>
+                <div id="chatMessages">
                     <div class="message bot-message">How are you feeling today? Let's have a mindful conversation.</div>
                 </div>
                 <div id="chatInput">
-                    <input type="text" id="messageInput" placeholder="Type your message..." style="width: 80%; padding: 5px;">
+                    <input type="text" id="messageInput" placeholder="Type your message...">
                     <button id="sendButton">
                         <svg viewBox="0 0 24 24" width="24" height="24" fill="white">
                             <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
@@ -268,18 +302,20 @@
                 const response = await fetch('http://127.0.0.1:9999/get_chat_history');
                 const data = await response.json();
                 
-                // Only clear and add welcome message if there's no history
+                // Clear existing messages
+                chatMessages.innerHTML = '';
+                
                 if (data.history.length === 0) {
-                    chatMessages.innerHTML = '<div class="message bot-message">How are you feeling today? Let\'s have a mindful conversation.</div>';
+                    // Show welcome message only on fresh start
+                    addMessageToChat("How are you feeling today? Let's have a mindful conversation.", false);
                 } else {
-                    // Clear existing messages
-                    chatMessages.innerHTML = '';
-                    
-                    // Add each message from history, excluding transcriptions
+                    // Add each message from history
                     data.history.forEach(msg => {
-                        // Only show messages that were part of the chat interaction
-                        if (msg.source !== 'transcription') {
-                            addMessageToChat(msg.content, msg.role === "user");
+                        // Show all messages EXCEPT those with source="transcription"
+                        if (!msg.source || msg.source !== 'transcription') {
+                            // Check if it's a user message (role === "user")
+                            const isUserMessage = msg.role === "user";
+                            addMessageToChat(msg.content, isUserMessage);
                         }
                     });
                 }
@@ -300,6 +336,15 @@
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
 
+        function addLoadingIndicator() {
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'message bot-message loading-indicator';
+            loadingDiv.innerHTML = '<div class="loading-dots"><span></span><span></span><span></span></div>';
+            chatMessages.appendChild(loadingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return loadingDiv;
+        }
+
         async function sendMessage() {
             const message = messageInput.value.trim();
             if (!message) return;
@@ -307,6 +352,9 @@
             // Add user message to chat
             addMessageToChat(message, true);
             messageInput.value = '';
+
+            // Add loading indicator
+            const loadingIndicator = addLoadingIndicator();
 
             try {
                 // Create a new div for the bot's response
@@ -321,6 +369,9 @@
                     },
                     body: JSON.stringify({ message: message })
                 });
+
+                // Remove loading indicator
+                loadingIndicator.remove();
 
                 // Get a ReadableStream of the response
                 const stream = response.body;
@@ -368,23 +419,17 @@
             }
         });
 
-        document.getElementById('resetButton').addEventListener('click', async function() {
+        document.getElementById('resetButton').addEventListener('click', async function(event) {
+            event.preventDefault();
+            
             try {
                 const response = await fetch('http://127.0.0.1:9999/reset_context', {
                     method: 'POST'
                 });
                 const data = await response.json();
                 
-                // Clear the chat messages UI and add welcome message
-                const chatMessages = document.getElementById('chatMessages');
-                chatMessages.innerHTML = '<div class="message bot-message">Context has been reset. How can I help you?</div>';
-                
-                // Ensure the container maintains its size
-                chatMessages.style.height = '300px';
-                chatMessages.style.border = '1px solid #ccc';
-                chatMessages.style.overflowY = 'scroll';
-                chatMessages.style.padding = '10px';
-                chatMessages.style.marginBottom = '10px';
+                // Instead of manually setting innerHTML, use loadChatHistory()
+                addMessageToChat("Context has been reset. How can I help you?", false);
                 
             } catch (error) {
                 console.error('Error:', error);
@@ -394,3 +439,4 @@
     </script>
 </body>
 </html>
+

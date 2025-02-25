@@ -129,16 +129,14 @@
         let colorPhase = 0;
 
         function animateGradient() {
-            // Slow rotation
             rotationAngle = (rotationAngle + 0.05) % 360;
-
-            // Dynamic color movement within sky colors
             colorPhase = (colorPhase + 0.005) % (Math.PI * 2);
-            const color1 = `hsl(210, ${90 + Math.sin(colorPhase) * 10}%, ${95 + Math.sin(colorPhase) * 5}%)`; // Light blue to white
-            const color2 = `hsl(215, ${80 + Math.cos(colorPhase) * 10}%, ${85 + Math.cos(colorPhase) * 5}%)`; // Medium light blue
-            const color3 = `hsl(220, ${70 + Math.sin(colorPhase + Math.PI/2) * 10}%, ${75 + Math.sin(colorPhase + Math.PI/2) * 5}%)`; // Slightly darker blue
+            const color1 = `hsl(210, ${90 + Math.sin(colorPhase) * 10}%, ${95 + Math.sin(colorPhase) * 5}%)`;
+            const color2 = `hsl(215, ${80 + Math.cos(colorPhase) * 10}%, ${85 + Math.cos(colorPhase) * 5}%)`;
+            const color3 = `hsl(220, ${70 + Math.sin(colorPhase + Math.PI/2) * 10}%, ${75 + Math.sin(colorPhase + Math.PI/2) * 5}%)`;
 
             background.style.background = `linear-gradient(${rotationAngle}deg, ${color1}, ${color2}, ${color3})`;
+            updateButtonColor(color1, color2, color3);
             
             if (isRecording) {
                 requestAnimationFrame(animateGradient);
@@ -170,7 +168,6 @@
                         });
                         const data = await response.json();
                         console.log("Transcription:", data.transcription);
-                        // Removed automatic redirect to chat.html
                     } catch (error) {
                         console.error("Error:", error);
                     }
@@ -179,15 +176,24 @@
                 };
 
                 mediaRecorder.start();
-                recordButton.style.backgroundColor = '#66b3ff';
+                recordButton.style.backgroundColor = 'transparent';
+                recordButton.querySelector('svg').style.fill = '#ffffff';
                 animateGradient();
             } else {
                 // Stop Recording
                 mediaRecorder.stop();
                 recordButton.style.backgroundColor = '#ffffff';
+                recordButton.querySelector('svg').style.fill = '#003366';
                 background.style.background = 'linear-gradient(135deg, #e6f2ff, #b3d9ff, #66b3ff)';
             }
         });
+
+        function updateButtonColor(color1, color2, color3) {
+            if (isRecording) {
+                const gradientColor = `linear-gradient(${rotationAngle}deg, ${color1}, ${color2}, ${color3})`;
+                recordButton.style.background = gradientColor;
+            }
+        }
     </script>
 </body>
 </html>

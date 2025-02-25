@@ -1,1 +1,3 @@
 .codiumai
+__pycache__/
+*.pyc

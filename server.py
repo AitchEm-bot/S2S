@@ -1,8 +1,10 @@
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, Response, stream_with_context
 import os
 from handling import handlers
 from flask_cors import CORS
 from ollama import OllamaChat
+import json
+import requests
 
 save_text_to_file = handlers.save_text_to_file
 transcribe_audio = handlers.transcribe_audio
@@ -18,7 +20,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # Initialize Ollama chat
 ollama_chat = OllamaChat()
-ollama_chat.preload_model()
 
 def new_int_name():
     for name in os.listdir("uploads"):
@@ -70,13 +71,48 @@ def chat():
     
     print(f"Received message: {message}")  # Debug log
     
-    try:
-        response = ollama_chat.chat(message)
-        print(f"Ollama response: {response}")  # Debug log
-        return {"response": response}
-    except Exception as e:
-        print(f"Error in chat endpoint: {str(e)}")  # Debug log
-        return {"error": str(e)}, 500
+    def generate():
+        try:
+            response = requests.post(
+                f"http://localhost:11434/api/chat",
+                json={
+                    "model": ollama_chat.model_name,
+                    "messages": ollama_chat.context + [{"role": "user", "content": message}],
+                    "stream": True
+                },
+                stream=True
+            )
+            
+            current_message = ""
+            first_chunk = True  # Flag to track the first chunk
+            
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        response_json = json.loads(line.decode('utf-8'))
+                        if "message" in response_json:
+                            chunk = response_json["message"]["content"]
+                            
+                            # Remove leading space only from the first chunk
+                            if first_chunk and chunk:
+                                chunk = chunk.lstrip(' ')
+                                first_chunk = False
+                            
+                            current_message += chunk
+                            # Stream each chunk to the frontend
+                            yield json.dumps({"response": chunk}) + '\n'
+                    except json.JSONDecodeError as e:
+                        print(f"Error decoding JSON: {str(e)}, line: {line}")
+            
+            # After streaming is complete, add to context
+            if current_message:
+                ollama_chat.context.append({"role": "assistant", "content": current_message})
+                
+        except Exception as e:
+            print(f"Error in chat endpoint: {str(e)}")  # Debug log
+            yield json.dumps({"error": str(e)}) + '\n'
+
+    return Response(stream_with_context(generate()), mimetype='application/json')
 
 @app.route("/reset_context", methods=["POST"])
 def reset_context():

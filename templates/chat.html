@@ -91,6 +91,7 @@
             border-radius: 15px;
             max-width: 80%;
             word-wrap: break-word;
+            white-space: pre-wrap;
         }
 
         .user-message {
@@ -308,6 +309,11 @@
             messageInput.value = '';
 
             try {
+                // Create a new div for the bot's response
+                const responseDiv = document.createElement('div');
+                responseDiv.className = 'message bot-message';
+                chatMessages.appendChild(responseDiv);
+
                 const response = await fetch('http://127.0.0.1:9999/chat', {
                     method: 'POST',
                     headers: {
@@ -316,17 +322,41 @@
                     body: JSON.stringify({ message: message })
                 });
 
-                const data = await response.json();
-                
-                // Add bot response to chat
-                if (data.response) {
-                    addMessageToChat(data.response);
-                } else if (data.error) {
-                    addMessageToChat(`Error: ${data.error}`);
+                // Get a ReadableStream of the response
+                const stream = response.body;
+                const reader = stream.getReader();
+                let botMessage = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    // Convert the Uint8Array to text
+                    const chunk = new TextDecoder().decode(value);
+                    // Split by newlines in case multiple chunks arrived together
+                    const lines = chunk.split('\n');
+                    
+                    for (const line of lines) {
+                        if (line.trim()) {  // Only process non-empty lines
+                            try {
+                                const jsonResponse = JSON.parse(line);
+                                if (jsonResponse.response) {
+                                    // Update the message with the new chunk
+                                    botMessage += jsonResponse.response;
+                                    responseDiv.textContent = botMessage;
+                                    // Scroll to the latest message
+                                    chatMessages.scrollTop = chatMessages.scrollHeight;
+                                }
+                            } catch (e) {
+                                console.log('Error parsing JSON:', e);
+                            }
+                        }
+                    }
                 }
+
             } catch (error) {
                 console.error('Error:', error);
-                addMessageToChat('Error: Could not connect to the server');
+                addMessageToChat('Error: Could not connect to the server', false);
             }
         }
 

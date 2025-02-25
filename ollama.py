@@ -2,13 +2,11 @@ import requests
 import json
 
 class OllamaChat:
-    def __init__(self, model="mistral"):
-        self.model = model
+    def __init__(self, model_name="mistral"):
+        self.model_name = model_name
         self.base_url = "http://localhost:11434/api"
         self.context = []
         
-
-    
     def add_to_context(self, text):
         """Add transcribed text to context"""
         self.context.append({
@@ -30,7 +28,7 @@ class OllamaChat:
             response = requests.post(
                 f"{self.base_url}/chat",
                 json={
-                    "model": self.model,
+                    "model": self.model_name,
                     "messages": messages,
                     "stream": True
                 },
@@ -43,13 +41,14 @@ class OllamaChat:
                     if line:
                         try:
                             response_json = json.loads(line.decode('utf-8'))
-                            # Concatenate the chunks
+                            # Just append the content directly without any modification
                             assistant_message += response_json["message"]["content"]
-                            print(f"Received chunk: {response_json['message']['content']}")  # Debug log
                         except json.JSONDecodeError as e:
                             print(f"Error decoding JSON: {str(e)}, line: {line}")  # Debug log
                 
                 if assistant_message:
+                    # Remove only the first space if it exists, preserve all other formatting
+                    assistant_message = assistant_message.lstrip(' ')
                     # Add the assistant's response to the context
                     self.context.append({"role": "assistant", "content": assistant_message})
                     return assistant_message

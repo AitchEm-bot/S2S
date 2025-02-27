@@ -1,3 +1,9 @@
-.codiumai
 __pycache__/
 *.pyc
+
+# RAG-related
+chroma_db/
+.chroma/
+sentence-transformers/
+transcriptions/
+uploads/

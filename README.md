@@ -1,19 +1,31 @@
 ## LLM Voice Journal Demo
 
-
 To run the server, execute the `server.py` script. Once the server is running, open your web browser and navigate to [http://localhost:9999](http://localhost:9999). Avoid using the IP address; stick to `localhost` for accessing the application.
 
 Please note that there are a couple of UI issues that are being worked on. The server is built using Flask, with WhisperAI medium for processing and Ollama on Mistral for additional functionalities. The user interface is crafted using V0 and Cursor AI.
 
 ### Prerequisites
 
-Make sure you have the following installed:
-- Python 3.x
-- Flask
-- WhisperAI
-- Ollama
-- V0
-- Cursor AI
+1. Install the required Python packages:
+```sh
+pip install -r requirements.txt
+```
+
+2. Install Ollama:
+   - For macOS/Linux: 
+     ```sh
+     curl -fsSL https://ollama.ai/install.sh | sh
+     ```
+   - For Windows: Download from [Ollama.ai](https://ollama.ai)
+
+3. Start Ollama and pull the Mistral model:
+   ```sh
+   # Start Ollama service
+   ollama serve
+
+   # In a new terminal, pull the Mistral model
+   ollama pull mistral
+   ```
 
 ### Installation
 
@@ -32,10 +44,15 @@ Make sure you have the following installed:
 
 ### Running the Server
 
-Start the server by executing:
-```sh
-python server.py
-```
+1. Make sure Ollama is running:
+   ```sh
+   ollama serve
+   ```
+
+2. Start the server in a new terminal:
+   ```sh
+   python server.py
+   ```
 
 ### Accessing the Application
 
@@ -50,5 +67,6 @@ Open your web browser and go to [http://localhost:9999](http://localhost:9999).
 - **Backend**: Flask
 - **Processing**: WhisperAI medium, Ollama on Mistral
 - **Frontend**: V0, Cursor AI
+- **RAG**: ChromaDB, Sentence Transformers
 
 Feel free to contribute by submitting issues or pull requests.

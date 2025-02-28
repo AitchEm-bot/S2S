@@ -4,109 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mic Recording Page</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            font-family: Arial, sans-serif;
-            overflow: hidden;
-        }
-        
-        #background {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(135deg, #e6f2ff, #b3d9ff, #66b3ff);
-            z-index: -1;
-            transition: background 2s ease;
-        }
-        
-        .tab-container {
-            position: absolute;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            display: flex;
-            gap: 10px;
-            background: rgba(255, 255, 255, 0.2);
-            padding: 8px;
-            border-radius: 20px;
-            backdrop-filter: blur(10px);
-        }
-
-        .tab {
-            padding: 8px 20px;
-            border: none;
-            border-radius: 15px;
-            background: transparent;
-            color: #003366;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            font-size: 14px;
-        }
-
-        .tab.active {
-            background: white;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-
-        .content {
-            flex-grow: 1;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-
-        #recordButton {
-            background-color: #ffffff;
-            border: none;
-            border-radius: 50%;
-            width: 80px;
-            height: 80px;
-            cursor: pointer;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            transition: all 0.3s ease;
-            z-index: 1;
-        }
-        
-        #recordButton:hover {
-            transform: scale(1.1);
-            box-shadow: 0 6px 8px rgba(0, 0, 0, 0.2);
-        }
-        
-        #recordButton svg {
-            width: 40px;
-            height: 40px;
-            fill: #003366;
-        }
-
-        footer {
-            text-align: center;
-            padding: 10px;
-            color: #003366;
-            font-size: 12px;
-            position: absolute;
-            bottom: 0;
-            width: 100%;
-        }
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div id="background"></div>
     <nav class="tab-container">
-        <button class="tab" onclick="location.href='/'">Record</button>
-        <button class="tab active" onclick="location.href='/chat'">Chat</button>
+        <button class="tab active" onclick="location.href='/'">Record</button>
+        <button class="tab" onclick="location.href='/chat'">Chat</button>
     </nav>
     <main class="content">
         <button id="recordButton">
@@ -119,82 +23,7 @@
         <p>Mindful Journal & Chat © 2025 | Nurture your thoughts, cultivate peace</p>
     </footer>
     
-    <script>
-        let mediaRecorder;
-        let audioChunks = [];
-        let isRecording = false;
-        const recordButton = document.getElementById('recordButton');
-        const background = document.getElementById('background');
-        let rotationAngle = 135;
-        let colorPhase = 0;
-
-        function animateGradient() {
-            rotationAngle = (rotationAngle + 0.05) % 360;
-            colorPhase = (colorPhase + 0.005) % (Math.PI * 2);
-            const color1 = `hsl(210, ${90 + Math.sin(colorPhase) * 10}%, ${95 + Math.sin(colorPhase) * 5}%)`;
-            const color2 = `hsl(215, ${80 + Math.cos(colorPhase) * 10}%, ${85 + Math.cos(colorPhase) * 5}%)`;
-            const color3 = `hsl(220, ${70 + Math.sin(colorPhase + Math.PI/2) * 10}%, ${75 + Math.sin(colorPhase + Math.PI/2) * 5}%)`;
-
-            background.style.background = `linear-gradient(${rotationAngle}deg, ${color1}, ${color2}, ${color3})`;
-            updateButtonColor(color1, color2, color3);
-            
-            if (isRecording) {
-                requestAnimationFrame(animateGradient);
-            }
-        }
-        
-        recordButton.addEventListener('click', async function() {
-            isRecording = !isRecording;
-            
-            if (isRecording) {
-                // Start Recording
-                let stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
-                
-                mediaRecorder.ondataavailable = event => {
-                    audioChunks.push(event.data);
-                };
-
-                mediaRecorder.onstop = async () => {
-                    let audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-                    let formData = new FormData();
-                    formData.append("audio", audioBlob, "recording.wav");
-
-                    // Send to backend
-                    try {
-                        const response = await fetch("http://127.0.0.1:9999/listen_audio", {
-                            method: "POST",
-                            body: formData
-                        });
-                        const data = await response.json();
-                        console.log("Transcription:", data.transcription);
-                    } catch (error) {
-                        console.error("Error:", error);
-                    }
-
-                    audioChunks = [];
-                };
-
-                mediaRecorder.start();
-                recordButton.style.backgroundColor = 'transparent';
-                recordButton.querySelector('svg').style.fill = '#ffffff';
-                animateGradient();
-            } else {
-                // Stop Recording
-                mediaRecorder.stop();
-                recordButton.style.backgroundColor = '#ffffff';
-                recordButton.querySelector('svg').style.fill = '#003366';
-                background.style.background = 'linear-gradient(135deg, #e6f2ff, #b3d9ff, #66b3ff)';
-            }
-        });
-
-        function updateButtonColor(color1, color2, color3) {
-            if (isRecording) {
-                const gradientColor = `linear-gradient(${rotationAngle}deg, ${color1}, ${color2}, ${color3})`;
-                recordButton.style.background = gradientColor;
-            }
-        }
-    </script>
+    <script src="record.js"></script>
 </body>
 </html>
 

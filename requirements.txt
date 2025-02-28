@@ -1,17 +1,26 @@
 # Core dependencies
-flask
-requests
+flask>=2.3.3
+flask-cors>=4.0.0
+requests>=2.31.0
 
 # Audio processing
 whisper
 
 # RAG implementation
-chromadb
-sentence-transformers
+chromadb>=0.4.18
+sentence-transformers>=2.2.2
+numpy>=1.24.3
+
+# Testing
+pytest>=7.4.0
+
+# Optional dependencies
+python-dotenv>=1.0.0
+torch>=2.0.1  # Required by sentence-transformers
+transformers>=4.35.2  # Required for some advanced features
+pydantic>=1.10.8  # Required by chromadb
 
 # Dependencies we removed:
 # sounddevice (not used)
 # soundfile (not used)
-# numpy (not used directly, but is a dependency of other packages)
-# torch (not used directly, but is a dependency of sentence-transformers)
 # python-dotenv (not used) 

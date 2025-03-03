@@ -12,15 +12,29 @@ class handlers():
         try:
             print(f"\n=== AUDIO RECEIVED ===")
             print(f"Transcribing audio file: {audio_path}")
-            model = whisper.load_model("medium", device="cuda")
-            print(f"Whisper model loaded, starting transcription...")
+            
+            # Check if CUDA is available
+            import torch
+            if torch.cuda.is_available():
+                print(f"CUDA is available. Using GPU: {torch.cuda.get_device_name(0)}")
+                device = "cuda"
+            else:
+                print("CUDA is not available. Using CPU instead.")
+                device = "cpu"
+                
+            # Load the model with the appropriate device
+            model = whisper.load_model("medium", device=device)
+            print(f"Whisper model loaded on {device}, starting transcription...")
+            
+            # Add map_location parameter when transcribing to handle any device mismatches
             result = model.transcribe(audio_path)
             print(f"Transcription completed successfully")
-            # audio_path = "uploads/recording.wav"  # Change this to your actual file path
-            # transcription = transcribe_audio(audio_path)
             return result["text"]
         except Exception as e:
             print(f"Error during transcription: {str(e)}")
+            # Provide more helpful error message
+            if "CUDA" in str(e):
+                return f"Error: CUDA issue detected. {str(e)}. Try restarting the application or check your GPU drivers."
             return f"Error: {str(e)}"
     # transcribe_audio("uploads/recording.wav")
 

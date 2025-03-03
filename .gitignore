@@ -7,3 +7,7 @@ chroma_db/
 sentence-transformers/
 transcriptions/
 uploads/
+venv/
+TTS.md
+test_rag.py
+test_entity_tracker.py

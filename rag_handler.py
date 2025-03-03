@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer
 import json
 import re
 import uuid
+from entity_tracker import EntityTracker
 
 class RAGHandler:
     def __init__(self, config=None):
@@ -46,6 +47,9 @@ class RAGHandler:
         
         # Ephemeral memory (cleared on restart)
         self.ephemeral_memory = []
+        
+        # Initialize entity tracker
+        self.entity_tracker = EntityTracker()
         
         # Run memory maintenance on startup (unless skipped)
         if not self.thresholds.get("skip_maintenance", False):
@@ -203,10 +207,9 @@ class RAGHandler:
             traceback.print_exc()
             
     def semantic_similarity(self, text1, text2):
-        """Calculate semantic similarity between two texts
+        """Calculate semantic similarity between two texts using embeddings
         
-        This is a simple implementation using word overlap.
-        In a production system, you would use embeddings for better semantic matching.
+        This uses the sentence transformer model to create embeddings and calculate cosine similarity.
         
         Args:
             text1 (str): First text
@@ -215,27 +218,48 @@ class RAGHandler:
         Returns:
             float: Similarity score between 0 and 1
         """
+        # Handle None or empty texts
+        if text1 is None or text2 is None:
+            return 0.0
+            
+        text1 = str(text1).strip()
+        text2 = str(text2).strip()
+        
         if not text1 or not text2:
             return 0.0
             
-        # Convert to lowercase and split into words
-        words1 = set(text1.lower().split())
-        words2 = set(text2.lower().split())
-        
-        # Remove common stop words
-        stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 
-                     'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
-        words1 = words1 - stop_words
-        words2 = words2 - stop_words
-        
-        # Calculate Jaccard similarity
-        if not words1 or not words2:
-            return 0.0
+        try:
+            # Generate embeddings for both texts
+            embedding1 = self.embed_model.encode(text1, convert_to_tensor=True)
+            embedding2 = self.embed_model.encode(text2, convert_to_tensor=True)
             
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        return intersection / union if union > 0 else 0.0
+            # Calculate cosine similarity
+            from torch.nn.functional import cosine_similarity
+            similarity = cosine_similarity(embedding1.unsqueeze(0), embedding2.unsqueeze(0)).item()
+            
+            return max(0.0, similarity)  # Ensure non-negative
+        except Exception as e:
+            print(f"Error calculating semantic similarity: {str(e)}")
+            
+            # Fall back to simpler method if embedding fails
+            # Convert to lowercase and split into words
+            words1 = set(text1.lower().split())
+            words2 = set(text2.lower().split())
+            
+            # Remove common stop words
+            stop_words = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 
+                         'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
+            words1 = words1 - stop_words
+            words2 = words2 - stop_words
+            
+            # Calculate Jaccard similarity
+            if not words1 or not words2:
+                return 0.0
+                
+            intersection = len(words1.intersection(words2))
+            union = len(words1.union(words2))
+            
+            return intersection / union if union > 0 else 0.0
     
     def extract_key_points(self, text, source="chat"):
         """Extract key points from text using LLM
@@ -329,34 +353,98 @@ Message: {filtered_text}
             print(f"Error extracting key points: {e}")
             return None
     
-    def importance_score(self, text):
-        """Calculate importance score of a message using multiple factors"""
-        score = 0.0
+    def importance_score(self, text, role="user"):
+        """Calculate the importance score of a message based on various factors"""
+        if not text or not isinstance(text, str):
+            return 0.0
+            
+        print(f"\n=== IMPORTANCE SCORING ===")
+        print(f"1. Evaluating {role} text: {text[:100]}...")
+        
+        # For assistant messages, return a fixed importance score
+        if role == "assistant":
+            fixed_importance = 0.3  # Just above the storage threshold
+            print(f"2. Fixed importance score for assistant message: {fixed_importance:.2f}")
+            return fixed_importance
+        
+        # Initialize score components
+        emotional_content_score = 0.0
+        keyword_score = 0.0
+        question_presence_score = 0.0
+        information_density_score = 0.0
+        entity_score = 0.0
+        
+        # Process text with entity tracker
+        important_entities = self.entity_tracker.update_entities(text)
+        
+        # Calculate entity-based importance score
+        if important_entities:
+            # Average importance of detected entities
+            entity_importance_avg = sum(entity["importance"] for entity in important_entities) / len(important_entities)
+            entity_score = entity_importance_avg * 0.4  # Entities contribute up to 40% of total score
+            
+            print(f"2. Found {len(important_entities)} important entities:")
+            for entity in important_entities[:3]:  # Show top 3
+                print(f"   - {entity['text']} ({entity['type']}): {entity['importance']:.2f}")
+        else:
+            print("2. No important entities found")
+        
+        # Check for emotional content
+        emotion_keywords = {
+            # Strong positive emotions
+            'love': 0.3, 'happy': 0.25, 'excited': 0.25, 'thrilled': 0.3, 'overjoyed': 0.3,
+            'ecstatic': 0.3, 'delighted': 0.25, 'grateful': 0.25, 'thankful': 0.25,
+            
+            # Strong negative emotions
+            'angry': 0.3, 'sad': 0.25, 'depressed': 0.3, 'anxious': 0.3, 'worried': 0.25,
+            'scared': 0.3, 'terrified': 0.3, 'frustrated': 0.25, 'upset': 0.25, 'hurt': 0.25,
+            'disappointed': 0.25, 'heartbroken': 0.3, 'devastated': 0.3, 'miserable': 0.3,
+            
+            # Moderate emotions
+            'good': 0.15, 'bad': 0.15, 'fine': 0.1, 'okay': 0.1, 'content': 0.15,
+            'annoyed': 0.15, 'irritated': 0.15, 'concerned': 0.15, 'nervous': 0.15,
+            
+            # Emotional states
+            'feeling': 0.1, 'feel': 0.1, 'felt': 0.1, 'emotion': 0.1, 'mood': 0.1,
+            'stress': 0.2, 'anxiety': 0.2, 'depression': 0.2, 'trauma': 0.2,
+            
+            # Intensifiers that suggest emotional content
+            'very': 0.05, 'really': 0.05, 'extremely': 0.1, 'incredibly': 0.1,
+            'so': 0.05, 'too': 0.05, 'absolutely': 0.1
+        }
         
         # Split text into words once for efficiency
         words = text.split()
-        word_count = len(words)
         
-        # 1. Length factor (max 0.3) - now explicitly using word count
-        length_score = min(word_count / 50.0, 1.0) * 0.3
-        score += length_score
+        # Check for emotion words in the text
+        emotion_score = 0
+        for word in words:
+            word_lower = word.lower().strip('.,!?;:')
+            if word_lower in emotion_keywords:
+                emotion_score += emotion_keywords[word_lower]
         
-        # 2. Key content indicators (max 0.3)
+        # Cap emotion score at 0.2
+        emotional_content_score = min(emotion_score, 0.2)
+        print(f"3. Emotional content score: {emotional_content_score:.2f}")
+        
+        # Check for key content indicators
         important_keywords = {
             'important': 0.1, 'remember': 0.1, 'key': 0.08, 
             'must': 0.08, 'critical': 0.1, 'essential': 0.08,
-            'note': 0.06, 'significant': 0.08
+            'note': 0.06, 'significant': 0.08, 'urgent': 0.1,
+            'priority': 0.1, 'crucial': 0.1
         }
-        keyword_score = sum(weight for word, weight in important_keywords.items() 
-                           if word in text.lower())
-        score += min(keyword_score, 0.3)
+        keyword_score_raw = sum(important_keywords.get(word.lower().strip('.,!?;:'), 0) for word in words)
+        keyword_score = min(keyword_score_raw, 0.15)
+        print(f"4. Keyword score: {keyword_score:.2f}")
         
-        # 3. Question presence (max 0.2)
+        # Check for question presence
         question_indicators = ['?', 'what', 'how', 'why', 'when', 'where', 'who']
         if any(indicator in text.lower() for indicator in question_indicators):
-            score += 0.2
+            question_presence_score = 0.15
+        print(f"5. Question presence score: {question_presence_score:.2f}")
         
-        # 4. Information density (max 0.2)
+        # Check for information density
         # Check for numbers, dates, proper nouns (capitalized words)
         info_indicators = sum([
             len([w for w in words if any(c.isdigit() for c in w)]) * 0.05,  # Numbers
@@ -365,16 +453,17 @@ Message: {filtered_text}
                     'april', 'may', 'june', 'july', 'august', 'september', 
                     'october', 'november', 'december']) else 0  # Dates
         ])
-        score += min(info_indicators, 0.2)
+        information_density_score = min(info_indicators, 0.1)
+        print(f"6. Information density score: {information_density_score:.2f}")
         
-        print(f"Importance score breakdown:")
-        print(f"- Length score: {length_score:.2f} (based on {word_count} words)")
-        print(f"- Keyword score: {keyword_score:.2f}")
-        print(f"- Question presence: {0.2 if any(indicator in text.lower() for indicator in question_indicators) else 0:.2f}")
-        print(f"- Information density: {min(info_indicators, 0.2):.2f}")
-        print(f"Final score: {min(score, 1.0):.2f}")
+        # Calculate total score with entity component
+        total_score = emotional_content_score + keyword_score + question_presence_score + information_density_score + entity_score
         
-        return min(score, 1.0)  # Ensure score doesn't exceed 1.0
+        # Ensure score is between 0 and 1
+        total_score = min(1.0, total_score)
+        
+        print(f"7. Final importance score: {total_score:.2f}")
+        return total_score
     
     def should_store(self, new_info):
         """Determine if new information should be stored"""
@@ -440,87 +529,23 @@ Message: {filtered_text}
             
         print(f"\n=== INTERACTION STORAGE ATTEMPT ===")
         
-        # Extract key points from user message using mistral model
-        if len(user_message) > self.thresholds["key_points_min_length"]:
-            print(f"1. Extracting key points from user message (length: {len(user_message.split())})")
-            user_key_points = self.extract_key_points(user_message, source="chat") 
-            if user_key_points is None:
-                print("   No key insights found in user message, using original")
-                user_key_points = user_message
-        else:
-            print(f"1. User message too short ({len(user_message.split())} words), using as is")
-            user_key_points = user_message
+        # Calculate importance for user message
+        user_importance = self.importance_score(user_message, role="user")
         
-        # Evaluate only the user's message for storage decision
-        print(f"\n=== STORAGE EVALUATION ===")
-        print(f"2. Evaluating user message importance")
-        
-        # Check importance of user message only
-        importance = self.importance_score(user_key_points)
-        if importance < self.thresholds["storage_min"]:
-            print(f"3. User message importance {importance:.2f} below threshold {self.thresholds['storage_min']}, discarding")
-            print("Skipping storage: Not important enough")
-            return
+        # Store user message if important enough
+        if user_importance > self.thresholds['storage_min']:
+            user_id = self.store_message(user_message, "user", user_importance)
             
-        # Check similarity with existing memories
-        all_memories = []
-        
-        # Combine all memory stores for similarity check
-        if hasattr(self, 'long_term_store') and self.long_term_store:
-            all_memories.extend(self.long_term_store)
-            
-        if hasattr(self, 'short_term_store') and self.short_term_store:
-            all_memories.extend(self.short_term_store)
-            
-        if hasattr(self, 'ephemeral_store') and self.ephemeral_store:
-            all_memories.extend(self.ephemeral_store)
-            
-        if all_memories:
-            highest_similarity = 0
-            similar_text = ""
-            
-            for memory in all_memories:
-                if 'text' not in memory:
-                    continue
-                    
-                similarity = self.semantic_similarity(user_key_points, memory['text'])
-                if similarity > highest_similarity:
-                    highest_similarity = similarity
-                    similar_text = memory['text']
+            # Store assistant message with a fixed importance score
+            if assistant_message and len(assistant_message) > 50:  # Only store substantial responses
+                fixed_importance = 0.3  # Just above the storage threshold
+                assistant_id = self.store_message(assistant_message, "assistant", fixed_importance)
                 
-                if similarity > self.thresholds["similarity_max"]:  # High similarity threshold
-                    print(f"4. Discarding due to high similarity ({similarity:.2f}) with existing memory")
-                    print(f"   Similar to: {similar_text[:100]}...")
-                    print("Skipping storage: Too similar to existing memories")
-                    return
-            
-            print(f"4. Highest similarity with existing memories: {highest_similarity:.2f}")
-        else:
-            print("4. No existing memories to compare with")
+                if user_id and assistant_id:
+                    print(f"Stored complete interaction: User ({user_id}) and Assistant ({assistant_id})")
+                    return True
         
-        # If we get here, we should store the interaction
-        # Extract key points from assistant message for storage
-        if len(assistant_message) > self.thresholds["key_points_min_length"]:
-            print(f"5. Extracting key points from assistant message (length: {len(assistant_message.split())})")
-            assistant_key_points = self.extract_key_points(assistant_message, source="chat")
-            if assistant_key_points is None:
-                print("   No key insights found in assistant message, using original")
-                assistant_key_points = assistant_message
-        else:
-            print(f"5. Assistant message too short ({len(assistant_message.split())} words), using as is")
-            assistant_key_points = assistant_message
-        
-        # Create combined text with key points for storage
-        combined_text = f"User: {user_key_points}\nAssistant: {assistant_key_points}"
-        
-        # Generate tags for the interaction
-        tags = self.generate_tags(combined_text)
-        
-        # Store the document
-        doc_id = self.store_document(combined_text, source="interaction")
-        
-        print(f"6. Stored interaction with ID: {doc_id}")
-        return doc_id
+        return False
     
     def generate_tags(self, text):
         """Generate tags for a memory based on content analysis"""
@@ -657,7 +682,42 @@ Message: {filtered_text}
         except Exception as e:
             print(f"Error retrieving all tags: {e}")
             return []
-    
+            
+    def clear_collection(self):
+        """Clear all memory collections (long-term, short-term, and ephemeral)"""
+        try:
+            print("\n=== CLEARING ALL MEMORY COLLECTIONS ===")
+            
+            # Get all IDs from long-term memory
+            long_term_results = self.long_term_memory.get()
+            if long_term_results and 'ids' in long_term_results and long_term_results['ids']:
+                self.long_term_memory.delete(ids=long_term_results['ids'])
+                print(f"Cleared {len(long_term_results['ids'])} items from long-term memory")
+            
+            # Get all IDs from short-term memory
+            short_term_results = self.short_term_memory.get()
+            if short_term_results and 'ids' in short_term_results and short_term_results['ids']:
+                self.short_term_memory.delete(ids=short_term_results['ids'])
+                print(f"Cleared {len(short_term_results['ids'])} items from short-term memory")
+            
+            # Clear ephemeral memory
+            ephemeral_count = len(self.ephemeral_memory)
+            self.ephemeral_memory = []
+            print(f"Cleared {ephemeral_count} items from ephemeral memory")
+            
+            # Clear storage buffer
+            buffer_count = len(self.storage_buffer)
+            self.storage_buffer = []
+            print(f"Cleared {buffer_count} items from storage buffer")
+            
+            print("=== MEMORY COLLECTIONS CLEARED SUCCESSFULLY ===\n")
+            return True
+        except Exception as e:
+            print(f"Error clearing collections: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
     def categorize_memory(self, text, importance, source_type=""):
         """Determine which type of memory should store this information
         
@@ -669,6 +729,25 @@ Message: {filtered_text}
         Returns:
             str: The memory type to store in ("long_term", "short_term", or "ephemeral")
         """
+        # Check for important entities in the text
+        important_entities = []
+        if hasattr(self, 'entity_tracker'):
+            # Extract entities from the text
+            entities = self.entity_tracker.extract_entities(text)
+            # Find entities with high importance
+            for entity in entities:
+                entity_key = entity["text"].lower()
+                if entity_key in self.entity_tracker.entities:
+                    entity_data = self.entity_tracker.entities[entity_key]
+                    # If entity is important or mentioned multiple times
+                    if entity_data["importance"] > 0.7 or entity_data["mentions"] >= 3:
+                        important_entities.append(entity)
+        
+        # If text contains important entities, store in long-term memory
+        if important_entities and len(important_entities) > 0:
+            print(f"   Found {len(important_entities)} important entities - storing in long-term memory")
+            return "long_term"
+            
         # Special categorization for audio journal entries
         if "transcription_audio" in source_type:
             # Audio journals: ephemeral = 0.0, short-term = 0.3-0.5, long-term = >0.5
@@ -681,7 +760,8 @@ Message: {filtered_text}
         
         # Standard categorization for other content types
         # Long-term memory: high importance, contains key facts
-        if importance > self.thresholds["short_term_max"]:
+        # Lower the threshold for long-term memory from default
+        if importance > 0.6:  # Lowered from self.thresholds["short_term_max"]
             return "long_term"
             
         # Short-term memory: medium importance, might be useful for a while
@@ -952,134 +1032,517 @@ Message: {filtered_text}
         
         return doc_id
 
-    def search_relevant_context(self, query, max_results=3):
-        """Search for relevant information in the database based on the user's query.
+    def extract_keywords(self, text):
+        """Extract important keywords from text for filtering.
         
         Args:
-            query (str): The user's query or message
-            max_results (int): Maximum number of results to return
+            text (str): The text to extract keywords from
             
         Returns:
-            str: A concatenated string of relevant information, or empty string if none found
+            list: List of important keywords
         """
-        if not query or len(query.strip()) < 5:
+        # Handle None or empty text
+        if text is None or not text.strip():
+            return []
+            
+        # Simple stopword list
+        stopwords = {'a', 'an', 'the', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 
+                    'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of', 
+                    'that', 'this', 'these', 'those', 'it', 'its', 'have', 'has', 'had',
+                    'do', 'does', 'did', 'am', 'be', 'been', 'being', 'as', 'if', 'then',
+                    'so', 'than', 'such', 'both', 'each', 'few', 'more', 'most', 'some',
+                    'will', 'would', 'should', 'can', 'could', 'may', 'might', 'must'}
+        
+        # Split text into words and convert to lowercase
+        words = [word.lower() for word in text.split()]
+        
+        # Remove stopwords and short words
+        keywords = [word for word in words if word not in stopwords and len(word) > 2]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_keywords = [word for word in keywords if not (word in seen or seen.add(word))]
+        
+        return unique_keywords
+
+    def search_relevant_context(self, query, max_results=3, force_retrieval=False):
+        """Search for relevant context based on the query"""
+        if not query or not isinstance(query, str):
             return ""
             
-        print(f"Searching for context relevant to: '{query[:50]}...' if longer")
+        print(f"\n=== CONTEXT SEARCH ===")
+        print(f"1. Query: {query}")
         
-        # Combine all memory stores for search
-        all_memories = []
+        # Analyze query to determine if retrieval is needed
+        if not force_retrieval:
+            analysis = self.analyze_query(query)
+            if not analysis["retrieval_recommended"]:
+                print(f"2. Retrieval not recommended: {analysis['reason']}")
+                return ""
         
-        # Add long-term memories
-        if hasattr(self, 'long_term_store') and self.long_term_store:
-            all_memories.extend(self.long_term_store)
+        # Extract entities from the query
+        query_entities = self.entity_tracker.find_entities_in_query(query)
+        
+        # Extract keywords for filtering
+        keywords = self.extract_keywords(query)
+        
+        print(f"2. Extracted keywords: {keywords}")
+        if query_entities:
+            print(f"3. Found {len(query_entities)} relevant entities in query:")
+            for entity in query_entities:
+                print(f"   - {entity['text']} ({entity['type']}): {entity['importance']:.2f}")
+        
+        # Prepare results container
+        all_results = []
+        
+        # Search in long-term memory
+        try:
+            # Generate query embedding
+            query_embedding = self.embed_model.encode([query])[0].tolist()
             
-        # Add short-term memories
-        if hasattr(self, 'short_term_store') and self.short_term_store:
-            all_memories.extend(self.short_term_store)
+            # Search in long-term memory
+            results = self.long_term_memory.query(
+                query_embeddings=[query_embedding],
+                n_results=max_results
+            )
             
-        # Add ephemeral memories (if they exist)
-        if hasattr(self, 'ephemeral_store') and self.ephemeral_store:
-            all_memories.extend(self.ephemeral_store)
+            if results and 'documents' in results and results['documents']:
+                for i, doc in enumerate(results['documents'][0]):
+                    metadata = results['metadatas'][0][i] if 'metadatas' in results and results['metadatas'][0] else {}
+                    
+                    # Calculate semantic similarity score
+                    semantic_score = self.semantic_similarity(query, doc)
+                    
+                    # Calculate keyword match score
+                    doc_keywords = self.extract_keywords(doc)
+                    keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                    keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                    
+                    # Calculate entity match score
+                    entity_score = 0.0
+                    if query_entities:
+                        # Check if any entities from the query appear in this document
+                        entity_matches = 0
+                        for entity in query_entities:
+                            if entity['text'].lower() in doc.lower():
+                                entity_matches += 1
+                        entity_score = min(1.0, entity_matches / len(query_entities))
+                    
+                    # Combined score (60% semantic, 20% keyword, 20% entity)
+                    combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                    
+                    if combined_score > 0.5:  # Only include if combined score is above threshold
+                        all_results.append((combined_score, doc, metadata, 
+                                          semantic_score, keyword_score, entity_score))
+        except Exception as e:
+            print(f"Error searching long-term memory: {e}")
+        
+        # Search in short-term memory
+        try:
+            # Search in short-term memory
+            results = self.short_term_memory.query(
+                query_embeddings=[query_embedding],
+                n_results=max_results
+            )
             
-        if not all_memories:
-            print("No memories available to search")
+            if results and 'documents' in results and results['documents']:
+                for i, doc in enumerate(results['documents'][0]):
+                    metadata = results['metadatas'][0][i] if 'metadatas' in results and results['metadatas'][0] else {}
+                    
+                    # Calculate semantic similarity score
+                    semantic_score = self.semantic_similarity(query, doc)
+                    
+                    # Calculate keyword match score
+                    doc_keywords = self.extract_keywords(doc)
+                    keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                    keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                    
+                    # Calculate entity match score
+                    entity_score = 0.0
+                    if query_entities:
+                        # Check if any entities from the query appear in this document
+                        entity_matches = 0
+                        for entity in query_entities:
+                            if entity['text'].lower() in doc.lower():
+                                entity_matches += 1
+                        entity_score = min(1.0, entity_matches / len(query_entities))
+                    
+                    # Combined score (60% semantic, 20% keyword, 20% entity)
+                    combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                    
+                    if combined_score > 0.5:  # Only include if combined score is above threshold
+                        all_results.append((combined_score, doc, metadata, 
+                                          semantic_score, keyword_score, entity_score))
+        except Exception as e:
+            print(f"Error searching short-term memory: {e}")
+        
+        # Search in ephemeral memory
+        for memory in self.ephemeral_memory:
+            if 'text' in memory:
+                # Calculate semantic similarity score
+                semantic_score = self.semantic_similarity(query, memory['text'])
+                
+                # Calculate keyword match score
+                doc_keywords = self.extract_keywords(memory['text'])
+                keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                
+                # Calculate entity match score
+                entity_score = 0.0
+                if query_entities:
+                    # Check if any entities from the query appear in this document
+                    entity_matches = 0
+                    for entity in query_entities:
+                        if entity['text'].lower() in memory['text'].lower():
+                            entity_matches += 1
+                    entity_score = min(1.0, entity_matches / len(query_entities))
+                
+                # Combined score (60% semantic, 20% keyword, 20% entity)
+                combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                
+                if combined_score > 0.5:  # Only include if combined score is above threshold
+                    all_results.append((combined_score, memory['text'], memory.get('metadata', {}), 
+                                      semantic_score, keyword_score, entity_score))
+        
+        if not all_results:
+            print("4. No relevant memories found")
             return ""
             
-        print(f"Searching across {len(all_memories)} total memories")
-        
-        # Simple keyword matching for now
-        # In a production system, you would use embeddings and semantic search
-        query_words = set(query.lower().split())
-        scored_results = []
-        
-        for memory in all_memories:
-            if 'text' not in memory:
-                continue
-                
-            memory_text = memory['text'].lower()
-            # Count matching words
-            match_count = sum(1 for word in query_words if word in memory_text)
-            if match_count > 0:
-                # Score based on match count and recency
-                recency_factor = 1.0
-                if 'timestamp' in memory:
-                    age_hours = (time.time() - memory['timestamp']) / 3600
-                    recency_factor = max(0.5, 1.0 - (age_hours / 720))  # Decay over ~30 days
-                
-                score = match_count * recency_factor
-                scored_results.append((score, memory['text']))
-        
-        # Sort by score (highest first)
-        scored_results.sort(reverse=True)
+        # Sort by combined score (highest first)
+        all_results.sort(reverse=True, key=lambda x: x[0])
         
         # Take top results
-        top_results = [text for _, text in scored_results[:max_results]]
+        top_results = all_results[:max_results]
         
-        if not top_results:
-            print("No relevant memories found")
-            return ""
-            
-        print(f"Found {len(top_results)} relevant memories")
+        print(f"4. Found {len(top_results)} relevant memories")
         
         # Format the results
         formatted_results = []
-        for i, result in enumerate(top_results):
+        for i, (combined_score, text, metadata, semantic_score, keyword_score, entity_score) in enumerate(top_results):
             # Truncate long results
-            if len(result) > 300:
-                result = result[:297] + "..."
-            formatted_results.append(f"[Memory {i+1}]: {result}")
+            if len(text) > 300:
+                text = text[:297] + "..."
             
-        return "\n\n".join(formatted_results)
+            # Add source information if available
+            source_info = ""
+            if metadata and 'source' in metadata:
+                source_info = f" (Source: {metadata['source']})"
+            
+            # Add score information
+            score_info = f"[Relevance: {combined_score:.2f}, Semantic: {semantic_score:.2f}, Keyword: {keyword_score:.2f}, Entity: {entity_score:.2f}]"
+            
+            formatted_results.append(f"Memory {i+1}{source_info}: {text}\n{score_info}\n")
+        
+        # Join the formatted results
+        result_text = "\n".join(formatted_results)
+        
+        print(f"5. Returning {len(formatted_results)} memories")
+        return result_text
 
-    def store_transcription(self, text, source="transcription"):
-        """Store a transcription in the database with appropriate metadata.
+    def store_transcription(self, text, source="transcription", processed_text=None, role="user"):
+        """Store a transcription in the appropriate memory store
         
         Args:
-            text (str): The transcription text to store
-            source (str): The source of the transcription (e.g., "audio", "video")
+            text (str): The original transcription text
+            source (str): The source of the transcription
+            processed_text (str, optional): Processed version of the text (e.g., key points)
+            role (str): The role of the message sender ('user' or 'assistant')
             
         Returns:
-            str: The document ID if stored successfully, None otherwise
+            bool: True if stored, False otherwise
         """
-        if not text:
-            print("Empty transcription, not storing")
-            return None
+        if not text or not isinstance(text, str) or len(text.strip()) < 10:
+            print(f"Skipping transcription storage: Text too short or invalid")
+            return False
+            
+        print(f"\n=== TRANSCRIPTION STORAGE ===")
+        print(f"1. Processing transcription (length: {len(text.split())} words)")
         
-        # Create the full source type first to avoid reference errors
-        full_source = f"transcription_{source}"
+        # Calculate importance based on the original transcription
+        importance = self.importance_score(text, role=role)
+        print(f"2. Importance score: {importance:.2f}")
         
-        # Print detailed information about the transcription
-        word_count = len(text.split())
-        print("\n=== TRANSCRIPTION DETAILS ===")
-        print(f"Source: {source}")
-        print(f"Word count: {word_count}")
-        print(f"Original text: \"{text[:150]}{'...' if len(text) > 150 else ''}\"")
-        print("--------------------------------")
+        # Skip if below threshold
+        if importance < self.thresholds["storage_min"]:
+            print(f"3. Below storage threshold ({self.thresholds['storage_min']}), discarding")
+            return False
+        
+        # Use processed text if provided, otherwise use original
+        storage_text = processed_text if processed_text else text
+        
+        # Determine memory category based on importance
+        memory_type = self.categorize_memory(storage_text, importance, source_type=source)
+        print(f"4. Categorized as {memory_type} memory")
+        
+        # Generate metadata
+        metadata = {
+            "source": source,
+            "timestamp": time.time(),
+            "importance": importance,
+            "type": memory_type,
+            "role": role
+        }
+        
+        # Generate tags
+        tags = self.generate_tags(storage_text)
+        if tags:
+            # Convert tags list to a comma-separated string for ChromaDB compatibility
+            metadata["tags"] = ",".join(tags)
+            print(f"5. Generated tags: {', '.join(tags)}")
+        
+        # Store based on memory type
+        if memory_type == "ephemeral":
+            # Store in ephemeral memory (in-memory only)
+            memory_id = str(uuid.uuid4())
+            self.ephemeral_memory.append({
+                "id": memory_id,
+                "text": storage_text,
+                "metadata": metadata
+            })
+            print(f"6. Stored in ephemeral memory with ID: {memory_id}")
+            return True
+            
+        elif memory_type == "short_term":
+            # Store in short-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                self.short_term_memory.add(
+                    ids=[memory_id],
+                    documents=[storage_text],
+                    metadatas=[metadata]
+                )
+                print(f"6. Stored in short-term memory with ID: {memory_id}")
+                return True
+            except Exception as e:
+                print(f"Error storing in short-term memory: {e}")
+                return False
+                
+        elif memory_type == "long_term":
+            # Store in long-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                self.long_term_memory.add(
+                    ids=[memory_id],
+                    documents=[storage_text],
+                    metadatas=[metadata],
+                    embeddings=[self.embed_model.encode(storage_text).tolist()]
+                )
+                print(f"6. Stored in long-term memory with ID: {memory_id}")
+                return True
+            except Exception as e:
+                print(f"Error storing in long-term memory: {e}")
+                return False
+        
+        return False
 
-        # Try to extract key points if text is long enough
-        if word_count >= 5:
-            print("\nAttempting to extract key points...")
-            key_points = self.extract_key_points(text, source=full_source)
-            if key_points:
-                print(f"Extracted key points: \"{key_points}\"")
-            else:
-                print("No key points extracted")
+    def analyze_query(self, query):
+        """Analyze a query to determine if retrieval would be valuable.
+        
+        This function examines the query for specificity, ambiguity, and potential
+        for finding relevant information in the knowledge base.
+        
+        Args:
+            query (str): The user's query
+            
+        Returns:
+            dict: Analysis results including retrieval_recommended (bool) and reason
+        """
+        if not query or len(query.strip()) < 3:
+            return {"retrieval_recommended": False, "reason": "Query too short"}
+            
+        # 1. Check for question indicators (suggests information seeking)
+        question_indicators = ['?', 'what', 'how', 'why', 'when', 'where', 'who', 'which', 'did', 'do', 'is', 'are', 'can']
+        is_question = any(indicator in query.lower().split() or indicator == '?' and '?' in query for indicator in question_indicators)
+        
+        # 2. Check for specific entities or proper nouns (suggests specific information need)
+        words = query.split()
+        proper_nouns = [w for w in words if w and w[0].isupper() and not w.isupper()]
+        has_proper_nouns = len(proper_nouns) > 0
+        
+        # 3. Check for temporal references (suggests time-based information need)
+        temporal_indicators = ['yesterday', 'today', 'tomorrow', 'last', 'next', 'previous', 'upcoming', 
+                              'week', 'month', 'year', 'monday', 'tuesday', 'wednesday', 'thursday', 
+                              'friday', 'saturday', 'sunday', 'january', 'february', 'march', 'april',
+                              'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december']
+        has_temporal = any(indicator in query.lower() for indicator in temporal_indicators)
+        
+        # 4. Check for memory-related terms (suggests explicit memory recall)
+        memory_indicators = ['remember', 'recall', 'mentioned', 'said', 'told', 'talked', 'discussed', 'noted', 'recorded']
+        has_memory_terms = any(indicator in query.lower() for indicator in memory_indicators)
+        
+        # 5. Check for personal references (suggests personal information need)
+        personal_indicators = ['my', 'i', 'me', 'mine', 'we', 'our', 'us', 'ours']
+        has_personal_refs = any(indicator in query.lower().split() for indicator in personal_indicators)
+        
+        # Combine factors to make a decision
+        retrieval_score = sum([
+            1.0 if is_question else 0.0,
+            0.7 if has_proper_nouns else 0.0,
+            0.8 if has_temporal else 0.0,
+            0.9 if has_memory_terms else 0.0,
+            0.6 if has_personal_refs else 0.0
+        ])
+        
+        # Determine if retrieval is recommended
+        retrieval_recommended = retrieval_score >= 1.0  # At least one strong indicator
+        
+        # Determine the primary reason
+        reason = "General query"
+        if is_question:
+            reason = "Information-seeking question"
+        elif has_memory_terms:
+            reason = "Explicit memory recall request"
+        elif has_temporal:
+            reason = "Time-based information need"
+        elif has_proper_nouns:
+            reason = "Contains specific entities"
+        elif has_personal_refs:
+            reason = "Contains personal references"
+            
+        return {
+            "retrieval_recommended": retrieval_recommended,
+            "reason": reason,
+            "score": retrieval_score,
+            "factors": {
+                "is_question": is_question,
+                "has_proper_nouns": has_proper_nouns,
+                "has_temporal": has_temporal,
+                "has_memory_terms": has_memory_terms,
+                "has_personal_refs": has_personal_refs
+            }
+        }
+
+    def store_message(self, message, role, importance):
+        """Store a single message in the appropriate memory store
+        
+        Args:
+            message (str): The message text to store
+            role (str): The role of the message sender ('user' or 'assistant')
+            importance (float): The importance score of the message
+            
+        Returns:
+            str: The ID of the stored document, or None if not stored
+        """
+        if not message or not isinstance(message, str) or len(message) < 5:
+            print(f"Skipping storage: Message too short or invalid")
+            return None
+            
+        print(f"\n=== MESSAGE STORAGE ===")
+        print(f"1. Processing {role} message (length: {len(message.split())} words)")
+        
+        # Extract key points if the message is long enough
+        if len(message) > self.thresholds["key_points_min_length"]:
+            print(f"2. Extracting key points from message")
+            key_points = self.extract_key_points(message, source=role)
+            if key_points is None:
+                print("   No key insights found, using original")
+                key_points = message
         else:
-            print("\nText too short for key point extraction")
+            print(f"2. Message too short, using as is")
+            key_points = message
         
-        # Evaluation section
-        print("=== EVALUATING ===")
+        # Check similarity with existing memories
+        all_memories = []
         
-        # Calculate importance score before storing
-        if source == "audio":
-            importance = self.journal_importance_score(text)
-            print(f"Journal importance score: {importance:.2f}")
+        # Get all memories from collections
+        try:
+            long_term_results = self.long_term_memory.get()
+            if long_term_results and 'documents' in long_term_results:
+                for doc in long_term_results['documents']:
+                    all_memories.append({"text": doc})
+                    
+            short_term_results = self.short_term_memory.get()
+            if short_term_results and 'documents' in short_term_results:
+                for doc in short_term_results['documents']:
+                    all_memories.append({"text": doc})
+        except Exception as e:
+            print(f"Error retrieving memories for similarity check: {e}")
+        
+        # Add ephemeral memories
+        all_memories.extend(self.ephemeral_memory)
+        
+        if all_memories:
+            highest_similarity = 0
+            similar_text = ""
+            
+            for memory in all_memories:
+                if 'text' not in memory:
+                    continue
+                    
+                similarity = self.semantic_similarity(key_points, memory['text'])
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    similar_text = memory['text']
+                
+                if similarity > self.thresholds["similarity_max"]:  # High similarity threshold
+                    print(f"3. Discarding due to high similarity ({similarity:.2f}) with existing memory")
+                    print(f"   Similar to: {similar_text[:50]}...")
+                    return None
+            
+            print(f"4. Highest similarity with existing memories: {highest_similarity:.2f}")
         else:
-            importance = self.importance_score(text)
-            print(f"Standard importance score: {importance:.2f}")
+            print("4. No existing memories to compare with")
         
-        # Store the transcription using the document store method
-        doc_id = self.store_document(text, source=full_source)
+        # Determine memory category based on importance
+        memory_type = self.categorize_memory(key_points, importance, source_type=role)
+        print(f"5. Categorized as {memory_type} memory (importance: {importance:.2f})")
         
-        return doc_id
+        # Generate metadata
+        metadata = {
+            "source": role,
+            "timestamp": time.time(),
+            "importance": importance,
+            "type": memory_type
+        }
+        
+        # Generate tags
+        tags = self.generate_tags(key_points)
+        if tags:
+            # Convert tags list to a comma-separated string for ChromaDB compatibility
+            metadata["tags"] = ",".join(tags)
+            print(f"6. Generated tags: {', '.join(tags)}")
+        
+        # Store based on memory type
+        if memory_type == "ephemeral":
+            # Store in ephemeral memory (in-memory only)
+            memory_id = str(uuid.uuid4())
+            self.ephemeral_memory.append({
+                "id": memory_id,
+                "text": key_points,
+                "metadata": metadata
+            })
+            print(f"7. Stored in ephemeral memory with ID: {memory_id}")
+            return memory_id
+            
+        elif memory_type == "short_term":
+            # Store in short-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                self.short_term_memory.add(
+                    ids=[memory_id],
+                    documents=[key_points],
+                    metadatas=[metadata]
+                )
+                print(f"7. Stored in short-term memory with ID: {memory_id}")
+                return memory_id
+            except Exception as e:
+                print(f"Error storing in short-term memory: {e}")
+                return None
+                
+        elif memory_type == "long_term":
+            # Store in long-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                self.long_term_memory.add(
+                    ids=[memory_id],
+                    documents=[key_points],
+                    metadatas=[metadata],
+                    embeddings=[self.embed_model.encode(key_points).tolist()]
+                )
+                print(f"7. Stored in long-term memory with ID: {memory_id}")
+                return memory_id
+            except Exception as e:
+                print(f"Error storing in long-term memory: {e}")
+                return None
+        
+        return None

@@ -180,17 +180,24 @@ async function sendMessage() {
 async function resetContext() {
     try {
         const response = await fetch('http://localhost:9999/reset_context', {
-            method: 'POST'
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({})
         });
         const data = await response.json();
         
-        // Clear chat messages and add reset confirmation
-        chatMessages.innerHTML = '';
-        addMessageToChat("Context has been reset. How can I help you?", false);
+        // Instead of clearing chat messages, just add a notification
+        addMessageToChat(data.message, false);
+        
+        // Ensure auto-scroll is enabled for this notification
+        shouldAutoScroll = true;
+        chatMessages.scrollTop = chatMessages.scrollHeight;
         
     } catch (error) {
         console.error('Error:', error);
-        addMessageToChat('Error: Could not reset context');
+        addMessageToChat('Error: Could not reset context', false);
     }
 }
 

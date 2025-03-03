@@ -24,7 +24,11 @@ class OllamaChat:
         # Default system prompt if none provided
         if system_prompt is None:
             system_prompt = """You are a helpful AI assistant. Answer questions concisely and accurately.
-If you don't know something, say so rather than making up information."""
+If you don't know something, say so rather than making up information.
+
+IMPORTANT: When asked about previous conversations after a context reset, do not fabricate memories.
+If the context has been reset and you're asked what you remember, clearly state that the conversation
+history has been cleared and you don't have access to previous conversations."""
         self.system_prompt = system_prompt
         
         # Default options if none provided
@@ -43,6 +47,12 @@ If you don't know something, say so rather than making up information."""
         
         # Initialize RAG with configuration
         self.rag = RAGHandler(config=rag_config)
+        
+        # Store the last response
+        self.last_response = ""
+        
+        # Flag to track if the system was recently reset
+        self.recently_reset = False
         
         print(f"Initialized OllamaChat with model: {model}")
         print(f"RAG system initialized with configuration: {rag_config if rag_config else 'default'}")
@@ -79,35 +89,84 @@ If you don't know something, say so rather than making up information."""
             # Recalculate tokens
             total_tokens = sum(self.estimate_tokens(msg["content"]) for msg in self.context)
         
-    def chat(self, message, stream=True):
+    def chat(self, message, stream=True, context=None):
         """Chat with the model and manage context"""
-        # Evaluate message importance for RAG operations
-        message_importance = self.rag.importance_score(message)
+        # We still calculate importance for logging purposes
+        message_importance = self.rag.importance_score(message, role="user")
         print(f"Message importance: {message_importance:.2f}")
         
-        # Get relevant context using our new search method
-        relevant_context = self.rag.search_relevant_context(message, max_results=3)
+        # Extract entities from the message
+        entities = self.rag.entity_tracker.extract_entities(message)
+        if entities:
+            print(f"Extracted entities: {len(entities)}")
+            for entity in entities[:5]:  # Show top 5 entities
+                print(f"- {entity['text']} ({entity['type']})")
         
-        if relevant_context:
-            print(f"Found relevant context for the query:")
-            print(relevant_context)
+        # If context is not provided, use the RAG system to find relevant context
+        if context is None:
+            # Use the new query analysis to make smarter retrieval decisions
+            relevant_context = self.rag.search_relevant_context(message, max_results=3)
             
-            # Add context to the system message
-            context_prompt = f"""
-I'm providing you with some relevant information from my memory that might help answer the user's question:
+            if relevant_context:
+                print(f"Found relevant context for the query:")
+                print(relevant_context)
+                
+                # Add context to the system message with improved instructions
+                context_prompt = f"""
+I'm providing you with some relevant information from previous conversations with the user:
 
 {relevant_context}
 
-Use this information if it's relevant to the user's query. If it's not relevant, simply ignore it.
+Incorporate this information naturally in your response without explicitly mentioning that it comes from memory or stored information. 
+Make your response feel like a natural continuation of the conversation, as if you simply remembered these details.
+If the information isn't relevant to the current query, you can ignore it.
 """
+            else:
+                context_prompt = ""
+                print("No relevant context found for this query")
         else:
-            context_prompt = ""
-            print("No relevant context found for this query")
+            # Use the provided context
+            context_prompt = f"""
+I'm providing you with some relevant information for this conversation:
+
+{context}
+
+Incorporate this information naturally in your response without explicitly mentioning that it comes from memory or stored information. 
+Make your response feel like a natural continuation of the conversation, as if you simply remembered these details.
+If the information isn't relevant to the current query, you can ignore it.
+"""
+            print(f"Using provided context: {len(context)} characters")
+        
+        # Get entity summaries if available and relevant
+        entity_context = ""
+        query_entities = self.rag.entity_tracker.find_entities_in_query(message)
+        if query_entities:
+            print(f"Found {len(query_entities)} relevant entities in query:")
+            for entity in query_entities:
+                print(f"- {entity['text']} ({entity['type']})")
+                summary = self.rag.entity_tracker.get_entity_summary(entity['text'])
+                if summary:
+                    entity_context += f"\nEntity: {entity['text']} - {summary}\n"
+        
+        # Combine contexts
+        if entity_context:
+            if context_prompt:
+                context_prompt += "\n\nEntity Information:\n" + entity_context
+            else:
+                context_prompt = "Entity Information:\n" + entity_context
         
         # Prepare messages array with system prompt and context
         messages = [
             {"role": "system", "content": self.system_prompt}
         ]
+        
+        # If the system was recently reset and this is a query about memory,
+        # add an additional system message to reinforce not fabricating memories
+        if self.recently_reset and any(term in message.lower() for term in ["remember", "recall", "memory", "previous"]):
+            messages.append({
+                "role": "system", 
+                "content": "REMINDER: The conversation context was just reset. You have no access to previous conversations. Do not fabricate memories."
+            })
         
         # Add context if available
         if context_prompt:
@@ -131,18 +190,31 @@ Use this information if it's relevant to the user's query. If it's not relevant,
             response = self._chat(messages)
             yield response
         
+        # Store the last response
+        self.last_response = response
+        
         # Update context with the new exchange
         self.context.append({"role": "user", "content": message})
         self.context.append({"role": "assistant", "content": response})
+        
+        # Clear the recently reset flag after the first exchange
+        self.recently_reset = False
         
         # Manage context window size
         while len(self.context) > self.max_context_length:
             # Remove oldest messages first
             self.context.pop(0)
         
-        # Store the interaction in RAG if important enough
-        self.rag.store_interaction(message, response)
-        
+        # Store the user message if important enough
+        if message_importance > self.rag.thresholds['storage_min']:
+            self.rag.store_message(message, "user", message_importance)
+            
+            # We no longer store assistant messages as requested
+            # Commenting out the storage code
+            # if response and len(response) > 50:  # Only store substantial responses
+            #     fixed_importance = 0.3  # Just above the storage threshold
+            #     self.rag.store_message(response, "assistant", fixed_importance)
+
     def _chat(self, messages):
         """Send a chat request to Ollama API"""
         try:
@@ -164,9 +236,32 @@ Use this information if it's relevant to the user's query. If it's not relevant,
 
     def reset_context(self):
         """Reset both immediate context and RAG memory"""
-        self.context = []
-        self.rag.clear_collection()
-        return "Both conversation context and long-term memory have been cleared."
+        try:
+            # Clear the conversation context
+            self.context = []
+            self.last_response = ""
+            print("Cleared immediate conversation context")
+            
+            # Clear the RAG memory collections
+            rag_result = self.rag.clear_collection()
+            
+            # Reset the entity tracker
+            self.rag.entity_tracker = self.rag.entity_tracker.__class__()
+            print("Reset entity tracker")
+            
+            # Set the recently reset flag
+            self.recently_reset = True
+            
+            if rag_result:
+                return "Both conversation context and long-term memory have been cleared successfully."
+            else:
+                return "Conversation context cleared, but there was an issue clearing long-term memory."
+        except Exception as e:
+            error_msg = f"Error resetting context: {str(e)}"
+            print(error_msg)
+            import traceback
+            traceback.print_exc()
+            return error_msg
 
     def format_context(self, relevant_docs):
         """Format retrieved context for the LLM with improved structure"""
@@ -215,8 +310,29 @@ Use this information if it's relevant to the user's query. If it's not relevant,
                     except json.JSONDecodeError:
                         print(f"Error decoding JSON: {line}")
                         
+            # Store the full response
+            self.last_response = full_response
             return full_response
         except Exception as e:
             error_msg = f"Error in streaming chat: {str(e)}"
             print(error_msg)
             yield error_msg
+            
+    def get_last_response(self):
+        """Get the last response from the assistant"""
+        return self.last_response
+
+    def store_interaction(self, user_message, assistant_message):
+        """Store both sides of an interaction if they're important enough"""
+        # Calculate importance for user message only
+        user_importance = self.importance_score(user_message)
+        
+        # Store user message if important enough
+        if user_importance > self.thresholds['storage_min']:
+            self.store_message(user_message, "user", user_importance)
+            
+            # We no longer store assistant messages as requested
+            # Commenting out the storage code
+            # if assistant_message and len(assistant_message) > 50:  # Only store substantial responses
+            #     fixed_importance = 0.3  # Just above the storage threshold
+            #     self.store_message(assistant_message, "assistant", fixed_importance)

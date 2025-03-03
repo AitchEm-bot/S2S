@@ -5,6 +5,8 @@ from flask_cors import CORS
 from ollama import OllamaChat
 import json
 import requests
+import traceback
+from entity_tracker import EntityTracker
 
 save_text_to_file = handlers.save_text_to_file
 transcribe_audio = handlers.transcribe_audio
@@ -25,7 +27,16 @@ ollama_model = os.environ.get("OLLAMA_MODEL", "Mistral")
 system_prompt = """You are a therapist that will listen to the user and help them with
 their problems. Answer questions concisely and accurately.
 If you don't know something, say so rather than making up information.
-For code examples, provide clear explanations and well-commented code."""
+
+When I provide you with information from my memory, use it naturally in your responses.
+Don't explicitly mention that you're using "memory" or "stored information" unless the user
+specifically asks about your memory capabilities. Instead, seamlessly incorporate the
+information as if you naturally knew it from your conversation with the user.
+
+For example, instead of saying "According to my memory, you walked your dog yesterday",
+just say "You mentioned walking your dog yesterday" or simply reference the information
+directly: "Since you walked your dog yesterday, you might want to..."
+"""
 
 # Options for the Ollama model
 model_options = {
@@ -40,7 +51,7 @@ rag_config = {
     "storage_min": 0.3,           # Minimum score to store anything
     "ephemeral_max": 0.4,         # Maximum score for ephemeral memory
     "short_term_max": 0.7,        # Maximum score for short-term memory
-    "retrieval_min": 0.3,         # Minimum query importance for retrieval
+    "retrieval_min": 0.0,         # Set to 0 to allow all queries to be used for retrieval
     "similarity_max": 0.8,        # Maximum similarity to consider duplicate
     "ephemeral_similarity": 0.5,  # Minimum similarity for ephemeral retrieval
     "key_points_min_length": 30,  # Minimum length to trigger key points extraction
@@ -113,12 +124,13 @@ def listen_audio():
     audio_path = os.path.join(UPLOAD_FOLDER, filename)
     audio_file.save(audio_path)
     
-    transcription = transcribe_audio(f"uploads/{filename}")
+    # Get the original transcription
+    original_transcription = transcribe_audio(f"uploads/{filename}")
     
     # Check if transcription is empty
-    if not transcription.strip():
+    if not original_transcription.strip():
         return {
-            "transcription": transcription,
+            "transcription": original_transcription,
             "ollama_response": "Transcription is empty, not stored.",
             "debug_info": {
                 "stored_in_rag": False,
@@ -126,23 +138,67 @@ def listen_audio():
             }
         }
     
-    save_text_to_file(f"transcriptions/{filename[:-4]}.txt", transcription)
+    # Save the original transcription to a file
+    save_text_to_file(f"transcriptions/{filename[:-4]}.txt", original_transcription)
     
-    # Store summarized version in RAG - explicitly set source to "audio"
-    stored = ollama_chat.rag.store_transcription(transcription, source="audio")
+    # Process the transcription with Ollama to extract key points
+    # This simulates what would happen if we sent it to the LLM for processing
+    processed_transcription = original_transcription
+    try:
+        # Ask Ollama to summarize or extract key points
+        summarize_prompt = f"""Please extract the key points from this transcription, 
+        preserving important details, emotions, and facts:
+        
+        {original_transcription}
+        
+        Extract only the most important information in a concise format.
+        """
+        
+        # Use a non-streaming request to get the processed version
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that extracts key information from transcriptions."},
+            {"role": "user", "content": summarize_prompt}
+        ]
+        
+        # Get the processed transcription from Ollama
+        response = requests.post(
+            f"{ollama_base_url}/api/chat",
+            json={
+                "model": ollama_model,
+                "messages": messages,
+                "stream": False
+            }
+        )
+        
+        if response.status_code == 200:
+            processed_transcription = response.json()["message"]["content"]
+            print(f"Processed transcription: {processed_transcription}")
+    except Exception as e:
+        print(f"Error processing transcription: {str(e)}")
+        # Fall back to original transcription if processing fails
+        processed_transcription = original_transcription
+    
+    # Store the original transcription for importance evaluation, but save the processed version
+    stored = ollama_chat.rag.store_transcription(
+        original_transcription, 
+        source="audio",
+        processed_text=processed_transcription,
+        role="user"
+    )
     
     if stored:
         # Add original transcription to immediate context
         ollama_chat.context.append({
             "role": "user", 
-            "content": transcription, 
+            "content": original_transcription, 
             "source": "transcription"
         })
-        print(f"2. Added to immediate context. Context length: {len(ollama_chat.context)}")
+        print(f"Added to immediate context. Context length: {len(ollama_chat.context)}")
         
         return {
-            "transcription": transcription,
-            "ollama_response": "Transcription processed and summarized for long-term memory.",
+            "transcription": original_transcription,
+            "processed_transcription": processed_transcription,
+            "ollama_response": "Transcription processed and stored in memory.",
             "debug_info": {
                 "stored_in_rag": True,
                 "context_length": len(ollama_chat.context)
@@ -150,7 +206,7 @@ def listen_audio():
         }
     else:
         return {
-            "transcription": transcription,
+            "transcription": original_transcription,
             "ollama_response": "Transcription received but not stored due to low importance.",
             "debug_info": {
                 "reason": "Failed storage criteria"
@@ -166,13 +222,60 @@ def chat():
         if not message:
             return jsonify({"error": "No message provided"}), 400
             
+        # Calculate importance score for logging purposes
+        importance = ollama_chat.rag.importance_score(message, role="user")
+        print(f"Message importance: {importance:.2f}")
+        
+        # Extract entities from the message
+        entities = ollama_chat.rag.entity_tracker.extract_entities(message)
+        if entities:
+            print(f"Extracted entities: {len(entities)}")
+            for entity in entities[:5]:  # Show top 5 entities
+                print(f"- {entity['text']} ({entity['type']})")
+        
+        # Analyze if this is a question or information-seeking query
+        query_analysis = ollama_chat.rag.analyze_query(message)
+        
+        # Determine if we should retrieve context
+        should_retrieve = query_analysis['retrieval_recommended'] or importance > ollama_chat.rag.thresholds['retrieval_min']
+        
+        # Get relevant context if needed
+        context = ""
+        if should_retrieve:
+            context = ollama_chat.rag.search_relevant_context(message, force_retrieval=False)
+            if context:
+                print(f"Retrieved context: {len(context)} characters")
+            else:
+                print("No relevant context found")
+        
+        # Get entity summaries if available and relevant
+        entity_context = ""
+        if query_analysis['retrieval_recommended']:
+            query_entities = ollama_chat.rag.entity_tracker.find_entities_in_query(message)
+            if query_entities:
+                for entity in query_entities:
+                    summary = ollama_chat.rag.entity_tracker.get_entity_summary(entity['text'])
+                    if summary:
+                        entity_context += f"\nEntity: {entity['text']} - {summary}\n"
+        
+        # Combine contexts
+        if entity_context:
+            if context:
+                context += "\n\nEntity Information:\n" + entity_context
+            else:
+                context = "Entity Information:\n" + entity_context
+        
         # Stream the response
         def generate():
             first_chunk = True
             in_think_block = False
             buffer = ""
             
-            for chunk in ollama_chat.chat(message, stream=True):
+            # Store the message in memory if important enough
+            if importance > ollama_chat.rag.thresholds['storage_min']:
+                ollama_chat.rag.store_message(message, "user", importance)
+            
+            for chunk in ollama_chat.chat(message, stream=True, context=context):
                 # Check for <think> tags and filter content between them
                 if "<think>" in chunk:
                     # Split the chunk at <think>
@@ -221,18 +324,54 @@ def chat():
                         first_chunk = False
                         
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
-                
+            
+            # Store the complete response without importance scoring
+            complete_response = ollama_chat.get_last_response()
+            # We no longer store assistant messages as requested
+            # Commenting out the storage code
+            # if complete_response and len(complete_response) > 50:
+            #     # Store assistant response with a fixed importance score
+            #     # This ensures it's stored but doesn't use the importance scoring algorithm
+            #     fixed_importance = 0.3  # Just above the storage threshold
+            #     ollama_chat.rag.store_message(complete_response, "assistant", fixed_importance)
+            
         return Response(generate(), mimetype='text/event-stream')
     except Exception as e:
         error_msg = f"Error in chat: {str(e)}"
         print(error_msg)
-        return jsonify({"error": error_msg})
+        traceback.print_exc()
+        return jsonify({"error": error_msg}), 500
 
 @app.route("/reset_context", methods=["POST"])
 def reset_context():
-    """Reset both immediate context and RAG memory"""
-    response = ollama_chat.reset_context()
-    return {"message": response}
+    try:
+        # Reset the conversation context
+        ollama_chat.reset_context()
+        
+        # Clear the RAG memory
+        rag_result = ollama_chat.rag.clear_collection()
+        
+        # Clear the entity tracker
+        ollama_chat.rag.entity_tracker = EntityTracker()
+        
+        # Get data from request, handling both JSON and non-JSON requests
+        try:
+            data = request.json or {}
+        except:
+            # If request.json fails (not JSON content), use an empty dict
+            data = {}
+        
+        # Clear collections if requested (default to True if not specified)
+        if data.get('clear_memory', True):
+            message = "Both conversation context and long-term memory have been cleared successfully."
+        else:
+            message = "Conversation context has been cleared, but long-term memory is preserved."
+            
+        return jsonify({'status': 'success', 'message': message})
+    except Exception as e:
+        print(f"Error in reset_context: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Could not reset context. {str(e)}"}), 500
 
 @app.route("/get_chat_history")
 def get_chat_history():

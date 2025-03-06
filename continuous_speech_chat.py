@@ -31,6 +31,16 @@ import hashlib
 from pathlib import Path
 import io
 import sounddevice as sd
+import uuid
+
+# Import RAG handler
+try:
+    from rag_handler import RAGHandler
+    rag_available = True
+    print("RAG functionality available")
+except ImportError:
+    rag_available = False
+    print("RAG functionality not available - continuing without memory features")
 
 # Configuration
 LLM_API_URL = "http://localhost:11434/api/chat"  # Ollama API endpoint
@@ -39,6 +49,9 @@ VOICE = "af_heart"  # Kokoro TTS voice (af_heart, af_bella, etc.)
 LANG_CODE = "a"  # 'a' for American English, 'b' for British English
 SILENCE_THRESHOLD = 1500  # Amplitude threshold for silence detection
 SILENCE_DURATION = 1.5  # Seconds of silence before processing speech
+STORAGE_SILENCE_DURATION = 4.5  # Extra silence duration for storage mode (3s more than regular)
+STORAGE_TIMEOUT = 30  # Seconds to wait before timing out storage mode
+DEBUG_STORAGE = True  # Print debug messages for storage flow
 OUTPUT_DIR = "audio_output"  # Directory to store audio files
 WHISPER_MODEL_SIZE = "medium"  # Options: tiny, base, small, medium, large-v3
 FORMAT = pyaudio.paInt16
@@ -52,6 +65,7 @@ TTS_SAMPLE_RATE = 24000  # Sample rate for Kokoro TTS (24kHz)
 MAX_SENTENCE_LENGTH = 50  # Maximum words in a sentence before forcing a break
 AUDIO_CROSSFADE_MS = 200  # Milliseconds to crossfade between audio chunks
 TEXT_BUFFER_SIZE = 3  # Number of sentence chunks to accumulate before processing
+STORE_COMMANDS = ["store", "remember this", "save this"]  # Commands to trigger storage mode
 
 # Create output directories
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -65,6 +79,11 @@ is_processing = threading.Event()  # Flag to indicate when processing a message
 ollama_cache = {}  # In-memory cache for Ollama responses
 streaming_finished = threading.Event()  # Flag to indicate when streaming is complete
 exit_program = threading.Event()  # Flag to signal program should exit
+waiting_for_storage = threading.Event()  # Flag to indicate we're waiting for content to store
+storage_start_time = None
+
+# Initialize RAG handler if available
+rag_handler = RAGHandler() if rag_available else None
 
 # Pipeline queues for parallel processing
 text_chunk_queue = queue.Queue()  # Queue for text chunks from LLM
@@ -92,6 +111,196 @@ def get_cache_path(model_name, model_size=None):
     cache_hash = hash_obj.hexdigest()
     
     return os.path.join(CACHE_DIR, f"{cache_key}_{cache_hash}.cache")
+
+def get_relevant_context(query, max_results=3):
+    """Get relevant context from RAG handler if available"""
+    if not rag_available or rag_handler is None:
+        return None
+    
+    try:
+        # Search for relevant context
+        context = rag_handler.search_relevant_context(query, max_results=max_results)
+        if context and isinstance(context, str) and len(context) > 0:
+            # Format is already correct - just return it
+            return context
+        elif context and isinstance(context, list) and len(context) > 0:
+            # Handle list format (older version compatibility)
+            context_items = []
+            for item in context:
+                if isinstance(item, tuple) and len(item) >= 2:
+                    # Handle tuple format (score, text)
+                    context_items.append(f"Reference: {item[1]}")
+                elif isinstance(item, str):
+                    # Handle string format
+                    context_items.append(f"Reference: {item}")
+            
+            if context_items:
+                return "\n\n".join(context_items)
+        
+        return None
+    except Exception as e:
+        print(f"Error retrieving context: {e}")
+        traceback.print_exc()
+        return None
+
+def store_to_memory(text, importance=0.7):
+    """Store text to memory using RAG handler"""
+    if not rag_available or rag_handler is None:
+        print("Memory storage not available - skipping")
+        return False
+    
+    try:
+        # Store the text in memory
+        if DEBUG_STORAGE:
+            print(f"📝 Storing to memory: '{text}'")
+        else:
+            print(f"Storing to memory: {text[:50]}{'...' if len(text) > 50 else ''}")
+        
+        # Make sure the text is in a good format for storage
+        cleaned_text = text.strip()
+        if not cleaned_text or len(cleaned_text) < 3:
+            print("Text too short or empty - skipping storage")
+            return False
+            
+        # Try to store message using the RAG handler
+        try:
+            rag_handler.store_message(cleaned_text, role="user", importance=importance)
+            if DEBUG_STORAGE:
+                print("✅ Memory storage successful")
+            return True
+        except Exception as e:
+            print(f"Error using store_message, trying alternate method: {e}")
+            # Fallback to direct storage method
+            try:
+                # Get embedding for the text
+                embedding = rag_handler.embed_model.encode(cleaned_text)
+                
+                # Create metadata
+                metadata = {
+                    "source": "user_input",
+                    "timestamp": time.time(),
+                    "importance": importance
+                }
+                
+                # Generate a unique ID
+                doc_id = str(uuid.uuid4())
+                
+                # Choose memory store based on importance
+                memory_store = rag_handler.short_term_memory
+                if importance > 0.7:  # High importance goes to long-term
+                    memory_store = rag_handler.long_term_memory
+                
+                # Store directly in memory
+                memory_store.add(
+                    documents=[cleaned_text],
+                    embeddings=[embedding.tolist()],
+                    metadatas=[metadata],
+                    ids=[doc_id]
+                )
+                
+                if DEBUG_STORAGE:
+                    print("✅ Memory storage successful (using fallback method)")
+                return True
+            except Exception as e2:
+                print(f"Error storing to memory (fallback failed): {e2}")
+                traceback.print_exc()
+                return False
+    except Exception as e:
+        print(f"Error storing to memory: {e}")
+        traceback.print_exc()
+        return False
+
+def speak_storage_confirmation():
+    """Speak a confirmation message after storing information"""
+    confirmation = "Information stored in memory. What else can I help you with?"
+    print("Assistant: " + confirmation)
+    
+    if DEBUG_STORAGE:
+        print("🟢 STORAGE COMPLETE - Information stored successfully")
+    
+    try:
+        # Add to standard output pipeline to ensure visibility and consistent handling
+        text_chunk_queue.put(confirmation)
+        text_chunk_queue.join()  # Wait for processing
+        
+        # Direct audio approach for immediate feedback
+        generator = pipeline(confirmation, voice=VOICE, speed=1.0)
+        
+        for _, _, audio in generator:
+            if hasattr(audio, 'detach'):
+                audio = audio.detach().cpu().numpy()
+            
+            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            
+            max_val = np.max(np.abs(audio))
+            if max_val > 1.0:
+                audio = audio / max_val
+            
+            sd.play(audio, TTS_SAMPLE_RATE)
+            sd.wait()
+            break
+    
+    except Exception as e:
+        print(f"Error playing confirmation: {e}")
+        traceback.print_exc()
+
+def speak_storage_prompt():
+    """Speak a prompt asking what the user wants to store"""
+    prompt = "What would you like me to remember? I'll wait for you to finish speaking."
+    print("Assistant: " + prompt)
+    
+    if DEBUG_STORAGE:
+        print("🔴 STORAGE MODE ACTIVATED - Waiting for content to store")
+    
+    try:
+        # Add to standard output pipeline to ensure visibility
+        text_chunk_queue.put(prompt)
+        
+        # Direct audio approach for immediate feedback
+        generator = pipeline(prompt, voice=VOICE, speed=1.0)
+        
+        for _, _, audio in generator:
+            if hasattr(audio, 'detach'):
+                audio = audio.detach().cpu().numpy()
+            
+            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            
+            max_val = np.max(np.abs(audio))
+            if max_val > 1.0:
+                audio = audio / max_val
+            
+            sd.play(audio, TTS_SAMPLE_RATE)
+            sd.wait()
+            break
+    
+    except Exception as e:
+        print(f"Error playing storage prompt: {e}")
+        traceback.print_exc()
+
+def restart_audio_stream(p=None, stream=None):
+    """Safely close and restart the audio stream if needed"""
+    try:
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
+        
+        if p is None:
+            p = pyaudio.PyAudio()
+        
+        # Open a new stream
+        stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK)
+        print("🔄 Audio stream restarted")
+        return p, stream
+    except Exception as e:
+        print(f"Error restarting audio stream: {e}")
+        traceback.print_exc()
+        return p, None
 
 def load_models():
     """Load models with caching"""
@@ -201,6 +410,19 @@ def split_text_into_sentences(text):
 def stream_llm_response(messages):
     """Stream response from Ollama API with natural sentence chunking"""
     try:
+        # Check if we should augment with relevant context
+        if len(messages) >= 2 and messages[-1]['role'] == 'user':
+            user_query = messages[-1]['content']
+            relevant_context = get_relevant_context(user_query)
+            
+            if relevant_context:
+                # Add context to the system prompt temporarily for this request
+                augmented_messages = messages.copy()
+                system_content = augmented_messages[0]['content']
+                augmented_messages[0]['content'] = f"{system_content}\n\nRelevant context that may be helpful:\n{relevant_context}"
+                messages = augmented_messages
+                print(f"Added relevant context to the query")
+        
         # Prepare the request
         payload = {
             "model": LLM_MODEL,
@@ -486,6 +708,8 @@ def say_welcome_message():
 
 def process_messages():
     """Process messages from the queue and coordinate the pipeline stages"""
+    global storage_start_time
+    
     # Wait for models to be loaded
     models_loaded.wait()
     
@@ -510,9 +734,75 @@ def process_messages():
                 # Signal all threads to exit
                 text_chunk_queue.put(None)
                 break
+            
+            # Check if we're in storage mode (waiting for content to store)
+            if waiting_for_storage.is_set():
+                print(f"Storing message to memory: '{message}'")
+                # Store the message to memory
+                if store_to_memory(message):
+                    # Speak a confirmation
+                    speak_storage_confirmation()
+                    # Add confirmation to response queue to signal completion
+                    response_queue.put("Information stored in memory.")
+                else:
+                    # If storage failed, provide feedback
+                    failure_message = "Sorry, I was unable to store that information. Please try again."
+                    text_chunk_queue.put(failure_message)
+                    response_queue.put(failure_message)
                 
+                # Clear the storage mode flag - to be fully safe, we do this last
+                waiting_for_storage.clear()
+                if DEBUG_STORAGE:
+                    print("🟡 STORAGE MODE DEACTIVATED - Returning to normal conversation")
+                storage_start_time = None  # Reset the storage timeout
+                # The recording function now handles clearing the processing flag
+                # Don't clear is_processing here to avoid race conditions
+                message_queue.task_done()
+                continue
+            
             # Add user message to conversation history
             print(f"Processing user message: '{message}'")
+            
+            # Check if this is a storage command - more robust detection
+            message_lower = message.lower().strip()
+            is_storage_command = False
+            
+            # Check each storage command phrase
+            for cmd in STORE_COMMANDS:
+                if cmd in message_lower or message_lower.startswith(cmd) or message_lower.endswith(cmd):
+                    is_storage_command = True
+                    if DEBUG_STORAGE:
+                        print(f"🔍 Storage command detected: '{cmd}' in '{message_lower}'")
+                    break
+            
+            # Process storage command if detected and RAG is available
+            if is_storage_command and rag_available:
+                print("Storage command detected. Waiting for content to store...")
+                # Set flag to indicate we're waiting for content to store
+                waiting_for_storage.set()
+                # Set the storage start time for timeout monitoring
+                storage_start_time = time.time()
+                # Speak a prompt for what to store
+                speak_storage_prompt()
+                
+                # Explicitly unblock recording thread to ensure it can capture user's next input
+                text_chunk_queue.join()  # Wait for prompt to finish processing
+                audio_queue.join()      # Wait for all audio to be played
+                
+                # Clear the processing flag to allow recording again, but only after the prompt is played
+                # This ensures the system doesn't record its own prompt
+                print("Waiting for user to speak storage content...")
+                time.sleep(0.5)  # Small pause to ensure prompt is complete
+                is_processing.clear()
+                
+                # Signal recording state to ready
+                message_queue.task_done()
+                response_queue.put("ready_for_storage")  # Special signal
+                
+                # Skip the rest of the processing for this initial "store" command
+                continue
+            
+            # Normal message processing - add to conversation history
             conversation_history.append({"role": "user", "content": message})
             
             # Special handling for common conversational phrases
@@ -532,6 +822,13 @@ def process_messages():
                 
                 # Add to conversation history
                 conversation_history.append({"role": "assistant", "content": direct_response})
+                
+                # Store interaction in memory if available
+                if rag_available and rag_handler is not None:
+                    try:
+                        rag_handler.store_interaction(message, direct_response)
+                    except Exception as e:
+                        print(f"Error storing interaction: {e}")
                 
                 # Send directly to text chunk queue
                 text_chunk_queue.put(direct_response)
@@ -572,6 +869,13 @@ def process_messages():
             
             # Add assistant response to conversation history
             conversation_history.append({"role": "assistant", "content": response_text})
+            
+            # Store interaction in memory if available
+            if rag_available and rag_handler is not None:
+                try:
+                    rag_handler.store_interaction(message, response_text)
+                except Exception as e:
+                    print(f"Error storing interaction: {e}")
             
             # Wait for all pipeline stages to complete
             print("Waiting for text processing to complete...")
@@ -652,6 +956,8 @@ def is_silent(data_chunk, threshold=SILENCE_THRESHOLD):
 
 def record_and_transcribe_continuously():
     """Continuously record audio and transcribe it when silence is detected"""
+    global storage_start_time
+    
     # Wait for models to be loaded
     print("Waiting for models to load...")
     models_loaded.wait()
@@ -683,7 +989,7 @@ def record_and_transcribe_continuously():
         frames = []
         silent_chunks = 0
         recording = False
-        max_silent_chunks = int(SILENCE_DURATION * RATE / CHUNK)  # Convert seconds to chunks
+        last_activity_time = time.time()
         
         # For debugging - count how many consecutive non-silent chunks we've seen
         consecutive_sound_chunks = 0
@@ -692,13 +998,69 @@ def record_and_transcribe_continuously():
         
         while not exit_program.is_set():
             try:
+                # Check if stream is valid, restart if needed
+                if stream is None:
+                    p, stream = restart_audio_stream(p)
+                    if stream is None:
+                        print("⚠️ Could not restart audio stream, waiting...")
+                        time.sleep(1.0)
+                        continue
+                
+                # Check for storage mode timeout
+                if waiting_for_storage.is_set() and storage_start_time is not None:
+                    elapsed = time.time() - storage_start_time
+                    if elapsed > STORAGE_TIMEOUT:
+                        print(f"⚠️ Storage mode timed out after {elapsed:.1f} seconds")
+                        text_chunk_queue.put("I didn't hear anything to store. Please try again if you want to store something.")
+                        waiting_for_storage.clear()
+                        is_processing.clear()
+                        storage_start_time = None
+                        # Reset recording state
+                        recording = False
+                        frames = []
+                        silent_chunks = 0
+                
+                # If we're in storage mode, print debug info every few seconds
+                if waiting_for_storage.is_set() and DEBUG_STORAGE and storage_start_time is not None:
+                    if int(time.time()) % 3 == 0:  # Every 3 seconds
+                        # Only print once per second (avoid repeated messages)
+                        if not hasattr(record_and_transcribe_continuously, 'last_debug_time') or \
+                           time.time() - record_and_transcribe_continuously.last_debug_time > 2.5:
+                            print(f"👂 Still listening for storage content... (elapsed: {time.time() - storage_start_time:.1f}s)")
+                            record_and_transcribe_continuously.last_debug_time = time.time()
+                
                 # Don't record while processing a message
                 if is_processing.is_set():
                     time.sleep(0.1)
                     continue
                 
+                # Check for audio stream stalling (no activity for 10 seconds)
+                if time.time() - last_activity_time > 10.0:
+                    print("⚠️ Audio stream may be stalled, restarting...")
+                    p, stream = restart_audio_stream(p, stream)
+                    last_activity_time = time.time()
+                    # Also reset storage mode if it's active
+                    if waiting_for_storage.is_set():
+                        print("Re-activating storage mode after stream restart")
+                        # Clear and then re-set to ensure a fresh state
+                        waiting_for_storage.clear()
+                        waiting_for_storage.set()
+                        storage_start_time = time.time()
+                        # Reset recording state
+                        recording = False
+                        frames = []
+                        silent_chunks = 0
+                
                 # Read audio data
-                data = stream.read(CHUNK, exception_on_overflow=False)
+                try:
+                    data = stream.read(CHUNK, exception_on_overflow=False)
+                    last_activity_time = time.time()  # Update activity timestamp
+                except Exception as e:
+                    print(f"Error reading from audio stream: {e}")
+                    time.sleep(0.1)
+                    # Try to restart the stream
+                    p, stream = restart_audio_stream(p, stream)
+                    continue
                 
                 # Check if this chunk is silent
                 silent = is_silent(data)
@@ -731,6 +1093,19 @@ def record_and_transcribe_continuously():
                     else:
                         silent_chunks = 0
                     
+                    # Determine the appropriate silence duration based on mode
+                    if waiting_for_storage.is_set():
+                        # In storage mode, use longer silence duration
+                        silence_duration = STORAGE_SILENCE_DURATION
+                        if silent_chunks % 10 == 0 and silent_chunks > 0:  # Every ~0.5 seconds
+                            print(f"Waiting for storage input: silent for {silent_chunks * CHUNK / RATE:.1f}s...")
+                    else:
+                        # In normal mode, use standard silence duration
+                        silence_duration = SILENCE_DURATION
+                    
+                    # Calculate the number of chunks that represents the current silence duration
+                    max_silent_chunks = int(silence_duration * RATE / CHUNK)
+                    
                     # If we've had enough silent chunks, process the recording
                     if silent_chunks >= max_silent_chunks and len(frames) > max_silent_chunks:
                         print("Silence detected, processing speech...")
@@ -757,10 +1132,46 @@ def record_and_transcribe_continuously():
                                 # Put the transcribed text in the queue for processing
                                 message_queue.put(transcription.strip())
                                 
-                                # Wait for response to be processed before continuing
-                                print("Processing your message...")
-                                response = response_queue.get()
-                                print(f"Assistant: {response}")
+                                if waiting_for_storage.is_set():
+                                    print("Processing storage input...")
+                                    # Reset storage timeout
+                                    storage_start_time = None
+                                    # Wait for storage to be processed and confirmed
+                                    response = response_queue.get()
+                                    print(f"Assistant: {response}")
+                                    # Make sure recording can continue after storage handling
+                                    is_processing.clear()
+                                    # Reset for next recording
+                                    recording = False
+                                    frames = []
+                                    silent_chunks = 0
+                                    time.sleep(0.2)  # Small pause to ensure clean transition
+                                else:
+                                    # Check for special signals in the queue without blocking
+                                    try:
+                                        # Non-blocking check for ready_for_storage signal
+                                        response = response_queue.get_nowait()
+                                        if response == "ready_for_storage":
+                                            # This is just a signal, don't print it
+                                            print("Ready for storage input...")
+                                            is_processing.clear()
+                                            # Reset for next recording
+                                            recording = False
+                                            frames = []
+                                            silent_chunks = 0
+                                            continue
+                                        else:
+                                            # If it's a real response, print it
+                                            print(f"Assistant: {response}")
+                                    except queue.Empty:
+                                        # If no signal is waiting, proceed to normal processing
+                                        # Wait for response to be processed before continuing
+                                        print("Processing your message...")
+                                        response = response_queue.get()  # This will block until a response is available
+                                        print(f"Assistant: {response}")
+                                    
+                                    # The processing flag should be cleared after we get the response
+                                    is_processing.clear()
                                 
                                 # Check if program should exit
                                 if exit_program.is_set():

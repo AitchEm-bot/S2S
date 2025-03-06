@@ -49,9 +49,12 @@ async function loadChatHistory() {
 }
 
 function addMessageToChat(message, isUser = false) {
+    // Create message div
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
     messageDiv.textContent = message;
+    
+    // Add message to chat
     chatMessages.appendChild(messageDiv);
     
     // Only auto-scroll if user hasn't manually scrolled up
@@ -159,8 +162,12 @@ async function sendMessage() {
         // and show an empty response
         if (!receivedFirstChunk) {
             loadingIndicator.remove();
-            chatMessages.appendChild(responseDiv);
-            responseDiv.textContent = "No response received.";
+            
+            const emptyDiv = document.createElement('div');
+            emptyDiv.className = 'message bot-message';
+            emptyDiv.textContent = "No response received.";
+            
+            chatMessages.appendChild(emptyDiv);
             
             // Only auto-scroll if user hasn't manually scrolled up
             if (shouldAutoScroll) {

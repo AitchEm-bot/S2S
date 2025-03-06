@@ -393,15 +393,15 @@ def check_rag():
         
         # Process long-term memory
         long_term_messages = []
-        if 'metadatas' in long_term_results and long_term_results['metadatas']:
-            for i, metadata in enumerate(long_term_results['metadatas']):
-                long_term_messages.append(f"{i+1}. {metadata['text']}")
+        if 'metadatas' in long_term_results and 'documents' in long_term_results and long_term_results['metadatas']:
+            for i, (metadata, document) in enumerate(zip(long_term_results['metadatas'], long_term_results['documents'])):
+                long_term_messages.append(f"{i+1}. {document}")
         
         # Process short-term memory
         short_term_messages = []
-        if 'metadatas' in short_term_results and short_term_results['metadatas']:
-            for i, metadata in enumerate(short_term_results['metadatas']):
-                short_term_messages.append(f"{i+1}. {metadata['text']}")
+        if 'metadatas' in short_term_results and 'documents' in short_term_results and short_term_results['metadatas']:
+            for i, (metadata, document) in enumerate(zip(short_term_results['metadatas'], short_term_results['documents'])):
+                short_term_messages.append(f"{i+1}. {document}")
         
         # Process ephemeral memory
         ephemeral_messages = []

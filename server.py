@@ -7,10 +7,15 @@ import json
 import requests
 import traceback
 from entity_tracker import EntityTracker
+import re
+import time
+import uuid
+import hashlib
+import pickle
 
 save_text_to_file = handlers.save_text_to_file
 transcribe_audio = handlers.transcribe_audio
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static', template_folder='templates')
 CORS(app)
 
 integer_list = []
@@ -18,31 +23,27 @@ integer_list = []
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Cache settings
+CACHE_DIR = "model_cache"  # Directory to store model cache
+OLLAMA_CACHE_EXPIRY = 3600  # Cache Ollama responses for 1 hour (in seconds)
+ollama_cache = {}  # In-memory cache for Ollama responses
+DEBUG_MODE = False  # Set to True to enable detailed cache debugging
+
+# Create cache directory
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 # Initialize the chat client
 ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 # ollama_model = os.environ.get("OLLAMA_MODEL", "deepseek-r1")
 ollama_model = os.environ.get("OLLAMA_MODEL", "Mistral")
 
 # System prompt for the assistant
-system_prompt = """You are a therapist that will listen to the user and help them with
-their problems. Answer questions concisely and accurately.
-If you don't know something, say so rather than making up information.
-
-When I provide you with information from my memory, use it naturally in your responses.
-Don't explicitly mention that you're using "memory" or "stored information" unless the user
-specifically asks about your memory capabilities. Instead, seamlessly incorporate the
-information as if you naturally knew it from your conversation with the user.
-
-For example, instead of saying "According to my memory, you walked your dog yesterday",
-just say "You mentioned walking your dog yesterday" or simply reference the information
-directly: "Since you walked your dog yesterday, you might want to..."
-"""
+system_prompt = """You are a helpful assistant that can answer questions and help with tasks. Your main role is to be a good listener and a problem solver for the user's emotions"""
 
 # Options for the Ollama model
 model_options = {
-    "temperature": 0.7,
-    "top_p": 0.9,
-    "top_k": 40,
+    "temperature": 0.56,
+    "top_p": 0.8,
     "num_ctx": 8192  # Increased context window for deepseek-r1
 }
 
@@ -85,6 +86,87 @@ else:
         options=model_options,
         rag_config=no_maintenance_config
     )
+
+# Load cache on startup
+def load_ollama_cache():
+    """Load the Ollama response cache from disk"""
+    global ollama_cache
+    
+    cache_path = get_cache_path("ollama_responses")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                loaded_cache = pickle.load(f)
+                
+                # Filter out expired entries
+                current_time = time.time()
+                valid_entries = {k: v for k, v in loaded_cache.items() 
+                               if current_time - v[1] < OLLAMA_CACHE_EXPIRY}
+                
+                ollama_cache = valid_entries
+                print(f"Loaded {len(ollama_cache)} valid responses from cache")
+        except Exception as e:
+            print(f"Error loading Ollama cache: {e}")
+            ollama_cache = {}
+    else:
+        print("No Ollama cache found, starting with empty cache")
+        ollama_cache = {}
+
+def get_cache_path(model_name, model_size=None):
+    """Generate a cache path for a model"""
+    if model_size:
+        cache_key = f"{model_name}_{model_size}"
+    else:
+        cache_key = model_name
+    
+    # Create a hash of the cache key to use as filename
+    hash_obj = hashlib.md5(cache_key.encode())
+    cache_hash = hash_obj.hexdigest()
+    
+    return os.path.join(CACHE_DIR, f"{cache_key}_{cache_hash}.cache")
+
+def get_ollama_cache_key(model, messages, max_history=1):
+    """Generate a cache key for Ollama requests
+    
+    Args:
+        model (str): The model name
+        messages (list): The full message history
+        max_history (int): Maximum number of previous messages to include in the cache key
+                          (1 means just the current message, 2 means current + previous, etc.)
+    """
+    # For caching, we only want to consider the last few messages
+    # This prevents the cache from being too specific and allows for reuse
+    if max_history > 0 and len(messages) > 0:
+        # Always include the system message if present
+        system_message = None
+        if messages and messages[0]['role'] == 'system':
+            system_message = messages[0]
+        
+        # Get the last N messages (where N is max_history)
+        recent_messages = messages[-max_history:]
+        
+        # Add the system message back if it was present
+        if system_message:
+            recent_messages = [system_message] + recent_messages
+        
+        # Use these messages for the cache key
+        cache_messages = recent_messages
+    else:
+        # Use all messages if max_history is 0 or negative
+        cache_messages = messages
+    
+    # Create a string representation of the request
+    request_str = f"{model}_{json.dumps(cache_messages, sort_keys=True)}"
+    
+    # Hash it to create a cache key
+    hash_obj = hashlib.md5(request_str.encode())
+    return hash_obj.hexdigest()
+
+# Load cache on startup
+load_ollama_cache()
+
+# Interaction counter for unique IDs
+interaction_counter = 0
 
 def new_int_name():
     for name in os.listdir("uploads"):
@@ -265,6 +347,29 @@ def chat():
             else:
                 context = "Entity Information:\n" + entity_context
         
+        # Prepare messages for cache key generation
+        messages = ollama_chat.context.copy()
+        messages.append({"role": "user", "content": message})
+        
+        # Check cache before streaming
+        # Use only the current message for caching to avoid context-specific responses
+        cache_key = get_ollama_cache_key(ollama_chat.model, messages, max_history=1)
+        current_time = time.time()
+        
+        # Debug logging for cache (only visible in server logs)
+        if DEBUG_MODE:
+            print(f"Cache key: {cache_key}")
+            print(f"Cache hit: {cache_key in ollama_cache}")
+            if cache_key in ollama_cache:
+                cached_response, timestamp = ollama_cache[cache_key]
+                print(f"Cache age: {int(current_time - timestamp)} seconds")
+                print(f"Cache valid: {current_time - timestamp < OLLAMA_CACHE_EXPIRY}")
+                print(f"Cache response (first 50 chars): {cached_response[:50]}...")
+        else:
+            # Minimal logging in non-debug mode
+            if cache_key in ollama_cache:
+                print("Using optimized response generation")
+        
         # Stream the response
         def generate():
             first_chunk = True
@@ -275,6 +380,46 @@ def chat():
             if importance > ollama_chat.rag.thresholds['storage_min']:
                 ollama_chat.rag.store_message(message, "user", importance)
             
+            # Check if we have a cached response
+            if cache_key in ollama_cache:
+                cached_response, timestamp = ollama_cache[cache_key]
+                # Check if the cache is still valid and not empty
+                if current_time - timestamp < OLLAMA_CACHE_EXPIRY and cached_response and cached_response.strip():
+                    if DEBUG_MODE:
+                        print(f"Using cached response (cached {int(current_time - timestamp)} seconds ago)")
+                    else:
+                        print("Generating response...")
+                    
+                    # Add the cached response to the context
+                    ollama_chat.add_to_context("assistant", cached_response)
+                    
+                    # Stream the cached response in chunks to simulate typing effect
+                    # This ensures the frontend experience is consistent with non-cached responses
+                    
+                    # First, send a special flag to indicate this is a cached response
+                    # This is only for internal processing and won't be visible to the user
+                    yield f"data: {json.dumps({'cached_start': True})}\n\n"
+                    
+                    # Split the response into characters to simulate typing
+                    # We'll send chunks of characters to simulate a natural typing speed
+                    chunk_size = 5  # Characters per chunk
+                    
+                    # Process the response character by character
+                    for i in range(0, len(cached_response), chunk_size):
+                        # Get the next chunk of characters
+                        chunk = cached_response[i:i+chunk_size]
+                        # Send the chunk without the 'cached' flag
+                        yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                        # Add a small delay to simulate typing speed
+                        time.sleep(0.02)  # 20ms delay between chunks
+                    
+                    # Finally, send a flag to indicate the end of the cached response
+                    # This is only for internal processing and won't be visible to the user
+                    yield f"data: {json.dumps({'cached_end': True})}\n\n"
+                    
+                    return
+            
+            # If no cache hit, stream from Ollama
             for chunk in ollama_chat.chat(message, stream=True, context=context):
                 # Check for <think> tags and filter content between them
                 if "<think>" in chunk:
@@ -325,15 +470,25 @@ def chat():
                         
                     yield f"data: {json.dumps({'chunk': chunk})}\n\n"
             
-            # Store the complete response without importance scoring
+            # Store the complete response in cache
             complete_response = ollama_chat.get_last_response()
-            # We no longer store assistant messages as requested
-            # Commenting out the storage code
-            # if complete_response and len(complete_response) > 50:
-            #     # Store assistant response with a fixed importance score
-            #     # This ensures it's stored but doesn't use the importance scoring algorithm
-            #     fixed_importance = 0.3  # Just above the storage threshold
-            #     ollama_chat.rag.store_message(complete_response, "assistant", fixed_importance)
+            
+            # Only cache non-empty responses
+            if complete_response and complete_response.strip():
+                print(f"Caching response: '{complete_response[:100]}...'")
+                ollama_cache[cache_key] = (complete_response, current_time)
+                
+                # Save the cache periodically
+                if len(ollama_cache) % 5 == 0:
+                    try:
+                        cache_path = get_cache_path("ollama_responses")
+                        with open(cache_path, 'wb') as f:
+                            pickle.dump(ollama_cache, f)
+                        print(f"Saved {len(ollama_cache)} responses to cache")
+                    except Exception as e:
+                        print(f"Error saving cache: {e}")
+            else:
+                print("Response is empty, not caching")
             
         return Response(generate(), mimetype='text/event-stream')
     except Exception as e:
@@ -345,6 +500,21 @@ def chat():
 @app.route("/reset_context", methods=["POST"])
 def reset_context():
     try:
+        # Handle the cache file
+        cache_path = get_cache_path("ollama_responses")
+        
+        # Delete the cache file if it exists
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+                print(f"Deleted cache file: {cache_path}")
+            except Exception as e:
+                print(f"Error deleting cache file: {e}")
+        
+        # Clear the in-memory cache
+        ollama_cache.clear()
+        print("In-memory cache cleared")
+        
         # Reset the conversation context
         ollama_chat.reset_context()
         
@@ -363,13 +533,14 @@ def reset_context():
         
         # Clear collections if requested (default to True if not specified)
         if data.get('clear_memory', True):
-            message = "Both conversation context and long-term memory have been cleared successfully."
+            message = "Both conversation context and long-term memory have been cleared successfully. Response cache has been permanently deleted."
         else:
-            message = "Conversation context has been cleared, but long-term memory is preserved."
+            message = "Conversation context has been cleared, but long-term memory is preserved. Response cache has been permanently deleted."
             
         return jsonify({'status': 'success', 'message': message})
     except Exception as e:
-        print(f"Error in reset_context: {e}")
+        error_msg = f"Error in reset_context: {e}"
+        print(error_msg)
         traceback.print_exc()
         return jsonify({"error": f"Could not reset context. {str(e)}"}), 500
 
@@ -510,6 +681,120 @@ def provide_feedback():
             return jsonify({'status': 'error', 'message': 'Failed to process feedback'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.teardown_appcontext
+def save_cache_on_shutdown(exception=None):
+    """Save the cache when the application context tears down (server shutdown)"""
+    if ollama_cache:
+        try:
+            cache_path = get_cache_path("ollama_responses")
+            with open(cache_path, 'wb') as f:
+                pickle.dump(ollama_cache, f)
+            print(f"Saved {len(ollama_cache)} responses to cache on shutdown")
+        except Exception as e:
+            print(f"Error saving cache on shutdown: {e}")
+
+@app.route("/debug/context_and_cache", methods=["GET"])
+def debug_context_and_cache():
+    """Debug endpoint to check the current state of the context window and cache"""
+    try:
+        # Get the current context
+        context = ollama_chat.context
+        
+        # Get cache file info
+        cache_path = get_cache_path("ollama_responses")
+        cache_file_exists = os.path.exists(cache_path)
+        cache_file_size = os.path.getsize(cache_path) if cache_file_exists else 0
+        
+        # Get cache stats
+        cache_stats = {
+            "total_entries": len(ollama_cache),
+            "cache_size_kb": sum(len(pickle.dumps(item)) for item in ollama_cache.values()) / 1024,
+            "oldest_entry": min([timestamp for _, (_, timestamp) in ollama_cache.items()]) if ollama_cache else None,
+            "newest_entry": max([timestamp for _, (_, timestamp) in ollama_cache.items()]) if ollama_cache else None,
+            "cache_file": {
+                "exists": cache_file_exists,
+                "path": cache_path,
+                "size_kb": cache_file_size / 1024 if cache_file_exists else 0
+            }
+        }
+        
+        if cache_stats["oldest_entry"]:
+            cache_stats["oldest_entry_age"] = time.time() - cache_stats["oldest_entry"]
+            cache_stats["oldest_entry"] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cache_stats["oldest_entry"]))
+            
+        if cache_stats["newest_entry"]:
+            cache_stats["newest_entry_age"] = time.time() - cache_stats["newest_entry"]
+            cache_stats["newest_entry"] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cache_stats["newest_entry"]))
+        
+        # Get sample cache entries (up to 5)
+        sample_entries = []
+        for key, (response, timestamp) in list(ollama_cache.items())[:5]:
+            # Try to reconstruct what message generated this cache key
+            # This is just a best-effort attempt and may not be accurate
+            sample_entries.append({
+                "key": key,
+                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp)),
+                "age_seconds": int(time.time() - timestamp),
+                "response_preview": response[:100] + "..." if len(response) > 100 else response,
+                "response_length": len(response)
+            })
+        
+        cache_stats["sample_entries"] = sample_entries
+        
+        # Get RAG stats
+        rag_stats = {
+            "entity_count": len(ollama_chat.rag.entity_tracker.entities) if hasattr(ollama_chat.rag, 'entity_tracker') else 0,
+        }
+        
+        return jsonify({
+            "context_window": {
+                "length": len(context),
+                "messages": context,
+            },
+            "cache": cache_stats,
+            "rag": rag_stats
+        })
+    except Exception as e:
+        error_msg = f"Error getting debug info: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        return jsonify({"error": error_msg}), 500
+
+@app.route("/debug/clear_cache", methods=["POST"])
+def clear_cache():
+    """Manually clear the cache"""
+    try:
+        # Handle the cache file
+        cache_path = get_cache_path("ollama_responses")
+        
+        # Delete the cache file if it exists
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+                print(f"Deleted cache file: {cache_path}")
+            except Exception as e:
+                print(f"Error deleting cache file: {e}")
+                return jsonify({"status": "error", "message": f"Error deleting cache file: {str(e)}"}), 500
+        
+        # Clear the in-memory cache
+        ollama_cache.clear()
+        print("In-memory cache cleared")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Cache cleared successfully",
+            "details": {
+                "cache_file_deleted": not os.path.exists(cache_path),
+                "in_memory_cache_cleared": True,
+                "cache_file_path": cache_path
+            }
+        })
+    except Exception as e:
+        error_msg = f"Error clearing cache: {str(e)}"
+        print(error_msg)
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": error_msg}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=9999, host="0.0.0.0")

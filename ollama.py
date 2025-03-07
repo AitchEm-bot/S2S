@@ -242,6 +242,12 @@ If the information isn't relevant to the current query, you can ignore it.
             self.last_response = ""
             print("Cleared immediate conversation context")
             
+            # Reinitialize the system prompt to ensure a fresh start
+            if self.system_prompt:
+                # Only add the system prompt if it's not empty
+                self.context = [{"role": "system", "content": self.system_prompt}]
+                print("Reinitialized system prompt")
+            
             # Clear the RAG memory collections
             rag_result = self.rag.clear_collection()
             

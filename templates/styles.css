@@ -135,6 +135,8 @@ footer {
     background: #e6f2ff;
     color: #003366;
     align-self: flex-start;
+    margin-right: 50px;
+    white-space: pre-line;
 }
 
 #chatInput {
@@ -233,4 +235,29 @@ footer {
 @keyframes loading {
     0%, 80%, 100% { transform: scale(0); }
     40% { transform: scale(1); }
-} 
+}
+
+/* Context reset separator */
+.context-reset-separator {
+    display: flex;
+    align-items: center;
+    margin: 20px 0;
+    padding: 5px 0;
+}
+
+.separator-line {
+    flex-grow: 1;
+    height: 1px;
+    background-color: #ccc;
+}
+
+.separator-text {
+    padding: 0 10px;
+    color: #666;
+    font-size: 12px;
+    font-weight: bold;
+    text-transform: uppercase;
+    background-color: white;
+    border-radius: 10px;
+    margin: 0 10px;
+}

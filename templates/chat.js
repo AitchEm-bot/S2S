@@ -111,6 +111,9 @@ async function sendMessage() {
         const decoder = new TextDecoder();
         let receivedFirstChunk = false;
         let botMessage = '';
+        
+        // These flags are used internally and not displayed to the user
+        let isProcessingSpecialResponse = false;
 
         // Create a new div for the bot's response
         const responseDiv = document.createElement('div');
@@ -131,12 +134,25 @@ async function sendMessage() {
                     try {
                         const jsonStr = line.substring(5).trim();
                         const data = JSON.parse(jsonStr);
+                        
+                        // Handle special response flags (internal use only)
+                        if (data.cached_start) {
+                            isProcessingSpecialResponse = true;
+                            continue;
+                        }
+                        
+                        if (data.cached_end) {
+                            isProcessingSpecialResponse = false;
+                            continue;
+                        }
+                        
                         if (data.chunk) {
                             // If this is the first chunk, append the response div and remove loading indicator
                             if (!receivedFirstChunk) {
                                 chatMessages.appendChild(responseDiv);
                                 loadingIndicator.remove();
                                 receivedFirstChunk = true;
+                                
                                 // For the first chunk, make sure it doesn't start with whitespace
                                 botMessage = data.chunk.trimStart();
                             } else {
@@ -144,7 +160,12 @@ async function sendMessage() {
                                 botMessage += data.chunk;
                             }
                             
-                            responseDiv.textContent = botMessage;
+                            // Handle line breaks properly for all responses
+                            // Convert line breaks to <br> tags for proper display
+                            const formattedMessage = botMessage
+                                .replace(/\n/g, '<br>')
+                                .replace(/\r/g, '');
+                            responseDiv.innerHTML = formattedMessage;
                             
                             // Only auto-scroll if user hasn't manually scrolled up
                             if (shouldAutoScroll) {
@@ -195,10 +216,16 @@ async function resetContext() {
         });
         const data = await response.json();
         
-        // Instead of clearing chat messages, just add a notification
+        // Add a visual separator to indicate context reset
+        const separatorDiv = document.createElement('div');
+        separatorDiv.className = 'context-reset-separator';
+        separatorDiv.innerHTML = '<div class="separator-line"></div><div class="separator-text">Context Reset</div><div class="separator-line"></div>';
+        chatMessages.appendChild(separatorDiv);
+        
+        // Add a notification about the reset
         addMessageToChat(data.message, false);
         
-        // Ensure auto-scroll is enabled for this notification
+        // Ensure auto-scroll is enabled
         shouldAutoScroll = true;
         chatMessages.scrollTop = chatMessages.scrollHeight;
         
@@ -207,7 +234,6 @@ async function resetContext() {
         addMessageToChat('Error: Could not reset context', false);
     }
 }
-
 // Event listeners
 sendButton.addEventListener('click', sendMessage);
 messageInput.addEventListener('keypress', function(e) {

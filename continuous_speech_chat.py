@@ -799,23 +799,49 @@ def audio_playback_thread():
 
 def say_welcome_message():
     """Say a welcome message when the program starts"""
+    # Wait for models to be loaded
+    print("Waiting for models to load before saying welcome message...")
+    models_loaded.wait()
+    
     welcome_message = "Hello, I'm an AI assistant. How can I help you today?"
     print("Assistant: " + welcome_message)
     
-    # Use the standard audio pipeline for consistency
     try:
-        # Add to text chunk queue for processing through the standard pipeline
-        text_chunk_queue.put(welcome_message)
+        # Generate audio directly without using the pipeline
+        print(f"Generating welcome message audio...")
+        generator = pipeline(welcome_message.strip(), voice=VOICE, speed=1.0)
         
-        # Wait for the audio to be processed and played
-        time.sleep(0.5)  # Short delay to ensure the text is queued
-        
-        # Wait for audio queue to be empty before continuing
-        while not audio_queue.empty() or audio_playing.is_set():
-            time.sleep(0.1)
+        # Process the generated audio
+        welcome_audio = None
+        for _, _, audio in generator:
+            # Convert PyTorch Tensor to NumPy array if needed
+            if hasattr(audio, 'detach'):
+                audio = audio.detach().cpu().numpy()
             
-        # Play the user turn start cue to indicate it's the user's turn to speak
-        play_user_turn_start_cue()
+            # Ensure the data is float32
+            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
+                audio = audio.astype(np.float32)
+            
+            # Normalize if needed
+            max_val = np.max(np.abs(audio))
+            if max_val > 1.0:
+                audio = audio / max_val
+            
+            # Store the audio
+            welcome_audio = audio
+            break  # We only need the first chunk
+        
+        if welcome_audio is not None:
+            # Play the audio directly
+            print("Playing welcome message...")
+            sd.play(welcome_audio, TTS_SAMPLE_RATE)
+            sd.wait()  # Wait for playback to finish
+            print("Welcome message complete")
+            
+            # Play the user turn start cue
+            play_user_turn_start_cue()
+        else:
+            print("Failed to generate welcome message audio")
     
     except Exception as e:
         print(f"Error playing welcome message: {e}")
@@ -900,6 +926,13 @@ def process_messages():
                 print("Waiting for audio playback to complete...")
                 audio_queue.join()
                 
+                # Add a 4-second delay after the assistant's response and before prompting the user
+                print("Waiting 1 second before prompting user...")
+                time.sleep(1.0)
+                
+                # Play the user turn start cue to indicate it's the user's turn to speak
+                play_user_turn_start_cue()
+                
                 # Signal program to exit
                 exit_program.set()
                 response_queue.put(goodbye_message)
@@ -950,6 +983,10 @@ def process_messages():
             
             print("Waiting for audio playback to complete...")
             audio_queue.join()
+            
+            # Add a 4-second delay after the assistant's response and before prompting the user
+            print("Waiting 1 second before prompting user...")
+            time.sleep(1.0)
             
             # Play the user turn start cue to indicate it's the user's turn to speak
             play_user_turn_start_cue()
@@ -1189,9 +1226,6 @@ def record_and_transcribe_continuously():
                             # Set the processing flag to pause recording
                             is_processing.set()
                             
-                            # Play the user turn end cue to indicate the system is processing
-                            play_user_turn_end_cue()
-                            
                             # Save the recorded audio to a WAV file
                             audio_file = os.path.join(OUTPUT_DIR, "temp_user.wav")
                             wf = wave.open(audio_file, 'wb')
@@ -1202,8 +1236,16 @@ def record_and_transcribe_continuously():
                             wf.close()
                             
                             # Transcribe the audio
-                            segments, info = whisper_model.transcribe(audio_file, beam_size=5)
+                            segments, info = whisper_model.transcribe(
+                                audio_file, 
+                                beam_size=5,
+                                language="en",  # Force English language
+                                task="transcribe"  # Explicitly set to transcription task
+                            )
                             transcription = " ".join([segment.text for segment in segments])
+                            
+                            # Filter out hallucinated phrases like "Thanks for watching!"
+                            transcription = filter_hallucinations(transcription)
                             
                             if transcription:
                                 print(f"You: {transcription}")
@@ -1354,6 +1396,49 @@ def play_user_turn_end_cue():
         print(f"Error playing user turn end cue: {e}")
         traceback.print_exc()
 
+def filter_hallucinations(transcription):
+    """Filter out common hallucinated phrases from the transcription"""
+    # List of known hallucinated phrases to filter out
+    hallucination_phrases = [
+        "Thanks for watching!",
+        "Thanks for watching.",
+        "Thank you for watching!",
+        "Thank you for watching.",
+        "Don't forget to subscribe!",
+        "Don't forget to like and subscribe!",
+        "Please like and subscribe!",
+        "Like and subscribe!",
+        "Subscribe to our channel!",
+        "Hit the like button!",
+        "Leave a comment below!",
+        "Check the description below!",
+        "Follow us on social media!",
+        "See you in the next video!",
+        "Until next time!",
+        "Bon Appetit!"
+    ]
+    
+    # Check if the transcription consists entirely of hallucinated phrases
+    transcription_lower = transcription.lower().strip()
+    for phrase in hallucination_phrases:
+        if transcription_lower == phrase.lower():
+            print(f"Filtered out hallucinated phrase: '{transcription}'")
+            return ""
+    
+    # If the hallucinated phrase is part of a longer transcription, remove it
+    filtered_transcription = transcription
+    for phrase in hallucination_phrases:
+        filtered_transcription = filtered_transcription.replace(phrase, "")
+    
+    # Clean up any double spaces created by removing phrases
+    filtered_transcription = " ".join(filtered_transcription.split())
+    
+    # If we made changes, log it
+    if filtered_transcription != transcription:
+        print(f"Filtered hallucination from: '{transcription}' to '{filtered_transcription}'")
+    
+    return filtered_transcription
+
 def main():
     """Main function to run the continuous speech conversation"""
     try:
@@ -1364,13 +1449,17 @@ def main():
         print("Loading models...")
         load_models()
         
-        # Say welcome message
-        say_welcome_message()
-        
         # Start the message processing thread
+        # This will also start the audio generation and playback threads
         processing_thread = threading.Thread(target=process_messages)
         processing_thread.daemon = True
         processing_thread.start()
+        
+        # Give the threads a moment to initialize
+        time.sleep(1.0)
+        
+        # Say welcome message
+        say_welcome_message()
         
         # Start the continuous recording and transcription in the main thread
         record_and_transcribe_continuously()

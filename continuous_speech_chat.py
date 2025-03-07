@@ -33,6 +33,7 @@ import io
 import sounddevice as sd
 import uuid
 import warnings
+import re
 
 # Suppress specific PyTorch warnings
 warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
@@ -386,12 +387,51 @@ def load_models():
     models_loaded.set()
 
 def get_ollama_cache_key(model, messages):
-    """Generate a cache key for Ollama requests"""
-    # Create a string representation of the request
-    request_str = f"{model}_{json.dumps(messages, sort_keys=True)}"
-    # Hash it to create a cache key
-    hash_obj = hashlib.md5(request_str.encode())
-    return hash_obj.hexdigest()
+    """Generate a cache key for Ollama requests that is consistent for similar queries"""
+    try:
+        # Extract the last user message
+        user_message = ""
+        if messages:
+            # Find the last user message
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get('role') == 'user' and 'content' in msg:
+                    user_message = msg['content']
+                    break
+        
+        if not user_message:
+            # No user message found, use a fallback
+            return f"no_user_message_{int(time.time())}"
+        
+        # Normalize the message to ensure consistent keys
+        # 1. Convert to lowercase
+        normalized = user_message.lower()
+        # 2. Remove all punctuation and special characters
+        normalized = re.sub(r'[^\w\s]', '', normalized)
+        # 3. Remove extra whitespace
+        normalized = ' '.join(normalized.split())
+        # 4. Truncate to first 10 words to focus on the core question
+        words = normalized.split()
+        if len(words) > 10:
+            normalized = ' '.join(words[:10])
+            
+        # Create a simple key based on the model and normalized message
+        key_base = f"{model}_{normalized}"
+        
+        # Hash the key base to create a consistent cache key
+        hash_obj = hashlib.md5(key_base.encode())
+        cache_key = hash_obj.hexdigest()
+        
+        # Print debug info
+        print(f"Original message: '{user_message}'")
+        print(f"Normalized message: '{normalized}'")
+        print(f"Key base: '{key_base}'")
+        
+        return cache_key
+    except Exception as e:
+        print(f"Error generating cache key: {e}")
+        traceback.print_exc()
+        # Return a unique key to avoid cache hits in case of error
+        return f"error_{int(time.time())}"
 
 def is_sentence_boundary(text):
     """Determine if text ends at a natural sentence boundary"""
@@ -504,11 +544,24 @@ def stream_llm_response(messages):
         cache_key = get_ollama_cache_key(LLM_MODEL, messages)
         current_time = time.time()
         
+        print(f"Generated cache key: {cache_key}")
+        print(f"Cache has {len(ollama_cache)} entries")
+        
+        # Print all cache keys for comparison
+        if ollama_cache:
+            print("Available cache keys:")
+            for i, k in enumerate(ollama_cache.keys()):
+                print(f"  {i+1}. {k}")
+        
+        # Check if the key exists in the cache
         if cache_key in ollama_cache:
+            print(f"Cache hit for key: {cache_key}")
             cached_response, timestamp = ollama_cache[cache_key]
+            cache_age = int(current_time - timestamp)
+            
             # Check if the cache is still valid and not empty
-            if current_time - timestamp < OLLAMA_CACHE_EXPIRY and cached_response and cached_response.strip():
-                print(f"Using cached LLM response (cached {int(current_time - timestamp)} seconds ago)")
+            if cache_age < OLLAMA_CACHE_EXPIRY and cached_response and cached_response.strip():
+                print(f"Using cached LLM response (cached {cache_age} seconds ago)")
                 print(f"Cached response: '{cached_response[:100]}...'")
                 
                 # Split cached response into natural sentences
@@ -538,9 +591,11 @@ def stream_llm_response(messages):
                 return
             else:
                 if not cached_response or not cached_response.strip():
-                    print("Cached response is empty, generating new response")
+                    print(f"Cached response is empty, generating new response")
                 else:
-                    print(f"Cached response expired, generating new response")
+                    print(f"Cached response expired (age: {cache_age}s, expiry: {OLLAMA_CACHE_EXPIRY}s), generating new response")
+        else:
+            print(f"No cache entry found for key: {cache_key}")
         
         # For streaming response
         current_sentence = []
@@ -621,17 +676,10 @@ def stream_llm_response(messages):
         # Only cache non-empty responses
         if full_response_text and full_response_text.strip():
             print(f"Caching response: '{full_response_text[:100]}...'")
-        ollama_cache[cache_key] = (full_response_text, current_time)
-        
-        # Save the cache periodically
-        if len(ollama_cache) % 10 == 0:
-            try:
-                cache_path = get_cache_path("ollama_responses")
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(ollama_cache, f)
-                print(f"Saved {len(ollama_cache)} responses to cache")
-            except Exception as e:
-                print(f"Error saving cache: {e}")
+            ollama_cache[cache_key] = (full_response_text, current_time)
+            
+            # Save the cache immediately after each response
+            save_ollama_cache()
         else:
             print("Response is empty, not caching")
         
@@ -1045,21 +1093,71 @@ def load_ollama_cache():
     """Load the Ollama response cache from disk"""
     global ollama_cache
     
+    # Ensure cache directory exists
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    
     cache_path = get_cache_path("ollama_responses")
+    print(f"Looking for cache at: {cache_path}")
+    
     if os.path.exists(cache_path):
         try:
             with open(cache_path, 'rb') as f:
                 loaded_cache = pickle.load(f)
                 
-                # Filter out expired entries
-                current_time = time.time()
-                valid_entries = {k: v for k, v in loaded_cache.items() 
-                               if current_time - v[1] < OLLAMA_CACHE_EXPIRY}
+            # Check if the loaded cache is valid
+            if not isinstance(loaded_cache, dict):
+                print(f"Warning: Loaded cache is not a dictionary, got {type(loaded_cache)}. Starting with empty cache.")
+                ollama_cache = {}
+                return
                 
-                ollama_cache = valid_entries
-                print(f"Loaded {len(ollama_cache)} valid responses from cache")
+            # Filter out expired entries
+            current_time = time.time()
+            valid_entries = {}
+            expired_count = 0
+            
+            for k, v in loaded_cache.items():
+                # Check if the entry has the expected format (response, timestamp)
+                if not isinstance(v, tuple) or len(v) != 2:
+                    print(f"Warning: Cache entry for key {k[:10]}... has invalid format. Skipping.")
+                    continue
+                    
+                # Check if the entry is expired
+                if current_time - v[1] < OLLAMA_CACHE_EXPIRY:
+                    valid_entries[k] = v
+                else:
+                    expired_count += 1
+            
+            ollama_cache = valid_entries
+            print(f"Loaded {len(ollama_cache)} valid responses from cache (expired: {expired_count})")
+            
+            # Print all cache keys for debugging
+            if ollama_cache:
+                print("All cache keys:")
+                for i, k in enumerate(ollama_cache.keys()):
+                    print(f"  {i+1}. {k}")
+                    
+                # Print some sample cache entries for debugging
+                print("\nSample cache entries:")
+                for i, (k, v) in enumerate(list(ollama_cache.items())[:3]):
+                    print(f"  {i+1}. Key: {k}")
+                    print(f"     Response: '{v[0][:50]}...'")
+                    print(f"     Age: {int(current_time - v[1])}s")
+            
+            # Test the cache key generation with a few common phrases
+            test_phrases = ["hello", "hi there", "hey", "how are you"]
+            print("\nTesting cache key generation:")
+            for phrase in test_phrases:
+                test_messages = [{"role": "user", "content": phrase}]
+                test_key = get_ollama_cache_key(LLM_MODEL, test_messages)
+                print(f"  Phrase: '{phrase}' -> Key: {test_key}")
+                if test_key in ollama_cache:
+                    print(f"    ✓ Found in cache!")
+                else:
+                    print(f"    ✗ Not found in cache")
+            
         except Exception as e:
             print(f"Error loading Ollama cache: {e}")
+            traceback.print_exc()
             ollama_cache = {}
     else:
         print("No Ollama cache found, starting with empty cache")
@@ -1439,11 +1537,80 @@ def filter_hallucinations(transcription):
     
     return filtered_transcription
 
+def save_ollama_cache():
+    """Save the Ollama response cache to disk"""
+    global ollama_cache
+    
+    if not ollama_cache:
+        print("Cache is empty, nothing to save")
+        return
+        
+    try:
+        # Ensure cache directory exists
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        
+        cache_path = get_cache_path("ollama_responses")
+        with open(cache_path, 'wb') as f:
+            pickle.dump(ollama_cache, f)
+        print(f"Saved {len(ollama_cache)} responses to cache at {cache_path}")
+        return True
+    except Exception as e:
+        print(f"Error saving Ollama cache: {e}")
+        traceback.print_exc()
+        return False
+
+def seed_cache_with_common_phrases():
+    """Seed the cache with common greetings and phrases to ensure they're available"""
+    global ollama_cache
+    
+    # Only seed if the cache is empty or has very few entries
+    if len(ollama_cache) > 10:
+        print("Cache already has sufficient entries, skipping seeding")
+        return
+        
+    print("Seeding cache with common phrases...")
+    
+    # Common greetings and their responses
+    common_phrases = {
+        "hello": "Hello! How can I help you today?",
+        "hi": "Hi there! How can I assist you?",
+        "hey": "Hey! What can I do for you today?",
+        "how are you": "I'm doing well, thank you for asking! How can I help you?",
+        "good morning": "Good morning! How can I assist you today?",
+        "good afternoon": "Good afternoon! What can I help you with?",
+        "good evening": "Good evening! How may I assist you?",
+        "thanks": "You're welcome! Is there anything else I can help with?",
+        "thank you": "You're welcome! Let me know if you need anything else.",
+        "bye": "Goodbye! Have a great day!",
+        "goodbye": "Goodbye! It was nice chatting with you."
+    }
+    
+    # Current time for timestamp
+    current_time = time.time()
+    
+    # Add each phrase to the cache
+    for phrase, response in common_phrases.items():
+        # Generate a cache key for this phrase
+        test_messages = [{"role": "user", "content": phrase}]
+        cache_key = get_ollama_cache_key(LLM_MODEL, test_messages)
+        
+        # Only add if not already in cache
+        if cache_key not in ollama_cache:
+            ollama_cache[cache_key] = (response, current_time)
+            print(f"Added '{phrase}' to cache with key: {cache_key}")
+    
+    # Save the seeded cache
+    save_ollama_cache()
+    print(f"Cache seeded with {len(common_phrases)} common phrases")
+
 def main():
     """Main function to run the continuous speech conversation"""
     try:
         # Load Ollama cache
         load_ollama_cache()
+        
+        # Seed the cache with common phrases
+        seed_cache_with_common_phrases()
         
         # Load models
         print("Loading models...")
@@ -1480,10 +1647,7 @@ def main():
         # Save Ollama cache before exiting
         try:
             if ollama_cache:
-                cache_path = get_cache_path("ollama_responses")
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(ollama_cache, f)
-                print(f"Saved {len(ollama_cache)} responses to cache on exit")
+                save_ollama_cache()
         except Exception as e:
             print(f"Error saving cache on exit: {e}")
 

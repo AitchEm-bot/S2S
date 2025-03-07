@@ -8,6 +8,9 @@ import json
 import re
 import uuid
 from entity_tracker import EntityTracker
+import threading
+import faiss
+from functools import lru_cache
 
 class RAGHandler:
     def __init__(self, config=None):
@@ -51,12 +54,481 @@ class RAGHandler:
         # Initialize entity tracker
         self.entity_tracker = EntityTracker()
         
+        # Initialize FAISS indexes
+        self.initialize_faiss_indexes()
+        
+        # Background retrieval state
+        self.background_retrieval_result = None
+        self.background_retrieval_query = None
+        self.background_retrieval_complete = threading.Event()
+        
         # Run memory maintenance on startup (unless skipped)
         if not self.thresholds.get("skip_maintenance", False):
             self.maintain_memory()
         else:
             print("Skipping memory maintenance on startup (as configured)")
         
+    def initialize_faiss_indexes(self):
+        """Initialize FAISS indexes for fast vector search"""
+        print("Initializing FAISS indexes for fast vector search...")
+        
+        # Get the embedding dimension from the model
+        self.embedding_dimension = self.embed_model.get_sentence_embedding_dimension()
+        
+        # Create FAISS indexes
+        self.long_term_index = faiss.IndexFlatIP(self.embedding_dimension)  # Inner product (cosine similarity)
+        self.short_term_index = faiss.IndexFlatIP(self.embedding_dimension)
+        
+        # Load existing embeddings into FAISS
+        self.update_faiss_indexes()
+        
+        print(f"FAISS indexes initialized with dimension {self.embedding_dimension}")
+    
+    def update_faiss_indexes(self):
+        """Update FAISS indexes with current embeddings from ChromaDB"""
+        try:
+            # Reset indexes
+            self.long_term_index = faiss.IndexFlatIP(self.embedding_dimension)
+            self.short_term_index = faiss.IndexFlatIP(self.embedding_dimension)
+            
+            # Get all embeddings from long-term memory
+            long_term_results = self.long_term_memory.get()
+            if long_term_results and 'embeddings' in long_term_results and long_term_results['embeddings']:
+                # Convert embeddings to numpy array
+                embeddings = np.array(long_term_results['embeddings']).astype('float32')
+                
+                # Store mapping from FAISS index to ChromaDB ID
+                self.long_term_id_map = long_term_results['ids']
+                
+                # Add to FAISS index
+                if embeddings.size > 0:
+                    self.long_term_index.add(embeddings)
+                    print(f"Added {len(embeddings)} embeddings to long-term FAISS index")
+            
+            # Get all embeddings from short-term memory
+            short_term_results = self.short_term_memory.get()
+            if short_term_results and 'embeddings' in short_term_results and short_term_results['embeddings']:
+                # Convert embeddings to numpy array
+                embeddings = np.array(short_term_results['embeddings']).astype('float32')
+                
+                # Store mapping from FAISS index to ChromaDB ID
+                self.short_term_id_map = short_term_results['ids']
+                
+                # Add to FAISS index
+                if embeddings.size > 0:
+                    self.short_term_index.add(embeddings)
+                    print(f"Added {len(embeddings)} embeddings to short-term FAISS index")
+        
+        except Exception as e:
+            print(f"Error updating FAISS indexes: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Add the LRU cache for query results
+    @lru_cache(maxsize=100)
+    def cached_retrieve(self, query_str):
+        """Cache retrieval results for similar queries"""
+        print("Cache miss - performing new retrieval")
+        return self._search_relevant_context_impl(query_str)
+    
+    def search_relevant_context(self, query, max_results=3, force_retrieval=False):
+        """Search for relevant context based on the query with caching"""
+        if not query or not isinstance(query, str):
+            return ""
+            
+        print(f"\n=== CONTEXT SEARCH ===")
+        print(f"1. Query: {query}")
+        
+        # Analyze query to determine if retrieval is needed
+        if not force_retrieval:
+            analysis = self.analyze_query(query)
+            if not analysis["retrieval_recommended"]:
+                print(f"2. Retrieval not recommended: {analysis['reason']}")
+                return ""
+        
+        # Check if we have a cached result for this query
+        # We use a simplified version of the query for caching (lowercase, no punctuation)
+        cache_key = re.sub(r'[^\w\s]', '', query.lower())
+        
+        # Try to get from cache first
+        try:
+            print("2. Checking cache for similar queries...")
+            return self.cached_retrieve(cache_key)
+        except Exception as e:
+            print(f"Error using cache: {e}, falling back to direct search")
+            return self._search_relevant_context_impl(query, max_results)
+    
+    def start_background_retrieval(self, query, max_results=3):
+        """Start retrieval in the background while LLM generates response"""
+        if not query or not isinstance(query, str):
+            return
+        
+        # Reset background retrieval state
+        self.background_retrieval_result = None
+        self.background_retrieval_query = query
+        self.background_retrieval_complete.clear()
+        
+        # Start background thread
+        thread = threading.Thread(
+            target=self._background_retrieval_worker,
+            args=(query, max_results)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        print(f"Started background retrieval for query: {query[:50]}...")
+        return thread
+    
+    def _background_retrieval_worker(self, query, max_results):
+        """Worker function for background retrieval"""
+        try:
+            # Analyze query to determine if retrieval is needed
+            analysis = self.analyze_query(query)
+            if not analysis["retrieval_recommended"]:
+                print(f"Background retrieval not recommended: {analysis['reason']}")
+                self.background_retrieval_result = ""
+            else:
+                # Perform the actual retrieval
+                result = self._search_relevant_context_impl(query, max_results)
+                self.background_retrieval_result = result
+                
+            # Signal completion
+            self.background_retrieval_complete.set()
+            print("Background retrieval complete")
+            
+        except Exception as e:
+            print(f"Error in background retrieval: {e}")
+            self.background_retrieval_result = ""
+            self.background_retrieval_complete.set()
+    
+    def get_background_retrieval_result(self, timeout=None):
+        """Get the result of background retrieval, waiting if necessary"""
+        if self.background_retrieval_complete.wait(timeout):
+            return self.background_retrieval_result
+        return None
+    
+    def _search_relevant_context_impl(self, query, max_results=3):
+        """Implementation of context search using FAISS for fast vector search"""
+        # Extract entities from the query
+        query_entities = self.entity_tracker.find_entities_in_query(query)
+        
+        # Extract keywords for filtering
+        keywords = self.extract_keywords(query)
+        
+        print(f"3. Extracted keywords: {keywords}")
+        if query_entities:
+            print(f"4. Found {len(query_entities)} relevant entities in query:")
+            for entity in query_entities:
+                print(f"   - {entity['text']} ({entity['type']}): {entity['importance']:.2f}")
+        
+        # Prepare results container
+        all_results = []
+        
+        # Generate query embedding
+        query_embedding = self.embed_model.encode(query).astype('float32')
+        
+        # Search in long-term memory using FAISS
+        try:
+            # Reshape for FAISS
+            query_vector = query_embedding.reshape(1, -1)
+            
+            # Search in long-term index
+            if self.long_term_index.ntotal > 0:
+                # Get top results
+                scores, indices = self.long_term_index.search(query_vector, min(max_results, self.long_term_index.ntotal))
+                
+                # Process results
+                for i, idx in enumerate(indices[0]):
+                    if idx != -1 and scores[0][i] > 0.5:  # Valid index and good score
+                        # Get the corresponding ChromaDB ID
+                        chroma_id = self.long_term_id_map[idx]
+                        
+                        # Get the document from ChromaDB
+                        result = self.long_term_memory.get(ids=[chroma_id])
+                        
+                        if result and 'documents' in result and result['documents']:
+                            doc = result['documents'][0]
+                            metadata = result['metadatas'][0] if 'metadatas' in result and result['metadatas'] else {}
+                            
+                            # Calculate additional scores for ranking
+                            semantic_score = scores[0][i]  # Use FAISS score
+                            
+                            # Calculate keyword match score
+                            doc_keywords = self.extract_keywords(doc)
+                            keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                            keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                            
+                            # Calculate entity match score
+                            entity_score = 0.0
+                            if query_entities:
+                                # Check if any entities from the query appear in this document
+                                entity_matches = 0
+                                for entity in query_entities:
+                                    if entity['text'].lower() in doc.lower():
+                                        entity_matches += 1
+                                entity_score = min(1.0, entity_matches / len(query_entities))
+                            
+                            # Combined score (60% semantic, 20% keyword, 20% entity)
+                            combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                            
+                            if combined_score > 0.5:  # Only include if combined score is above threshold
+                                all_results.append((combined_score, doc, metadata, 
+                                                  semantic_score, keyword_score, entity_score))
+        except Exception as e:
+            print(f"Error searching long-term memory with FAISS: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Search in short-term memory using FAISS
+        try:
+            # Search in short-term index
+            if self.short_term_index.ntotal > 0:
+                # Get top results
+                scores, indices = self.short_term_index.search(query_vector, min(max_results, self.short_term_index.ntotal))
+                
+                # Process results
+                for i, idx in enumerate(indices[0]):
+                    if idx != -1 and scores[0][i] > 0.5:  # Valid index and good score
+                        # Get the corresponding ChromaDB ID
+                        chroma_id = self.short_term_id_map[idx]
+                        
+                        # Get the document from ChromaDB
+                        result = self.short_term_memory.get(ids=[chroma_id])
+                        
+                        if result and 'documents' in result and result['documents']:
+                            doc = result['documents'][0]
+                            metadata = result['metadatas'][0] if 'metadatas' in result and result['metadatas'] else {}
+                            
+                            # Calculate additional scores for ranking
+                            semantic_score = scores[0][i]  # Use FAISS score
+                            
+                            # Calculate keyword match score
+                            doc_keywords = self.extract_keywords(doc)
+                            keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                            keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                            
+                            # Calculate entity match score
+                            entity_score = 0.0
+                            if query_entities:
+                                # Check if any entities from the query appear in this document
+                                entity_matches = 0
+                                for entity in query_entities:
+                                    if entity['text'].lower() in doc.lower():
+                                        entity_matches += 1
+                                entity_score = min(1.0, entity_matches / len(query_entities))
+                            
+                            # Combined score (60% semantic, 20% keyword, 20% entity)
+                            combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                            
+                            if combined_score > 0.5:  # Only include if combined score is above threshold
+                                all_results.append((combined_score, doc, metadata, 
+                                                  semantic_score, keyword_score, entity_score))
+        except Exception as e:
+            print(f"Error searching short-term memory with FAISS: {e}")
+        
+        # Search in ephemeral memory
+        for memory in self.ephemeral_memory:
+            if 'text' in memory:
+                # Calculate semantic similarity score
+                semantic_score = self.semantic_similarity(query, memory['text'])
+                
+                # Calculate keyword match score
+                doc_keywords = self.extract_keywords(memory['text'])
+                keyword_matches = sum(1 for k in keywords if k in doc_keywords)
+                keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
+                
+                # Calculate entity match score
+                entity_score = 0.0
+                if query_entities:
+                    # Check if any entities from the query appear in this document
+                    entity_matches = 0
+                    for entity in query_entities:
+                        if entity['text'].lower() in memory['text'].lower():
+                            entity_matches += 1
+                    entity_score = min(1.0, entity_matches / len(query_entities))
+                
+                # Combined score (60% semantic, 20% keyword, 20% entity)
+                combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
+                
+                if combined_score > 0.5:  # Only include if combined score is above threshold
+                    all_results.append((combined_score, memory['text'], memory.get('metadata', {}), 
+                                      semantic_score, keyword_score, entity_score))
+        
+        if not all_results:
+            print("5. No relevant memories found")
+            return ""
+            
+        # Sort by combined score (highest first)
+        all_results.sort(reverse=True, key=lambda x: x[0])
+        
+        # Take top results
+        top_results = all_results[:max_results]
+        
+        print(f"5. Found {len(top_results)} relevant memories")
+        
+        # Format the results
+        formatted_results = []
+        for i, (combined_score, text, metadata, semantic_score, keyword_score, entity_score) in enumerate(top_results):
+            # Truncate long results
+            if len(text) > 300:
+                text = text[:297] + "..."
+            
+            # Add source information if available
+            source_info = ""
+            if metadata and 'source' in metadata:
+                source_info = f" (Source: {metadata['source']})"
+            
+            # Add score information
+            score_info = f"[Relevance: {combined_score:.2f}, Semantic: {semantic_score:.2f}, Keyword: {keyword_score:.2f}, Entity: {entity_score:.2f}]"
+            
+            formatted_results.append(f"Memory {i+1}{source_info}: {text}\n{score_info}\n")
+        
+        # Join the formatted results
+        result_text = "\n".join(formatted_results)
+        
+        print(f"6. Returning {len(formatted_results)} memories")
+        return result_text
+    
+    # Override store_message to update FAISS indexes
+    def store_message(self, message, role, importance):
+        """Store a single message in the appropriate memory store and update FAISS indexes"""
+        if not message or not isinstance(message, str) or len(message) < 5:
+            print(f"Skipping storage: Message too short or invalid")
+            return None
+            
+        print(f"\n=== MESSAGE STORAGE ===")
+        print(f"1. Processing {role} message (length: {len(message.split())} words)")
+        
+        # Extract key points if the message is long enough
+        if len(message) > self.thresholds["key_points_min_length"]:
+            print(f"2. Extracting key points from message")
+            key_points = self.extract_key_points(message, source=role)
+            if key_points is None:
+                print("   No key insights found, using original")
+                key_points = message
+        else:
+            print(f"2. Message too short, using as is")
+            key_points = message
+        
+        # Check similarity with existing memories
+        all_memories = []
+        
+        # Get all memories from collections
+        try:
+            long_term_results = self.long_term_memory.get()
+            if long_term_results and 'documents' in long_term_results:
+                for doc in long_term_results['documents']:
+                    all_memories.append({"text": doc})
+                    
+            short_term_results = self.short_term_memory.get()
+            if short_term_results and 'documents' in short_term_results:
+                for doc in short_term_results['documents']:
+                    all_memories.append({"text": doc})
+        except Exception as e:
+            print(f"Error retrieving memories for similarity check: {e}")
+        
+        # Add ephemeral memories
+        all_memories.extend(self.ephemeral_memory)
+        
+        if all_memories:
+            highest_similarity = 0
+            similar_text = ""
+            
+            for memory in all_memories:
+                if 'text' not in memory:
+                    continue
+                    
+                similarity = self.semantic_similarity(key_points, memory['text'])
+                if similarity > highest_similarity:
+                    highest_similarity = similarity
+                    similar_text = memory['text']
+                
+                if similarity > self.thresholds["similarity_max"]:  # High similarity threshold
+                    print(f"3. Discarding due to high similarity ({similarity:.2f}) with existing memory")
+                    print(f"   Similar to: {similar_text[:50]}...")
+                    return None
+            
+            print(f"4. Highest similarity with existing memories: {highest_similarity:.2f}")
+        else:
+            print("4. No existing memories to compare with")
+        
+        # Determine memory category based on importance
+        memory_type = self.categorize_memory(key_points, importance, source_type=role)
+        print(f"5. Categorized as {memory_type} memory (importance: {importance:.2f})")
+        
+        # Generate metadata
+        metadata = {
+            "source": role,
+            "timestamp": time.time(),
+            "importance": importance,
+            "type": memory_type
+        }
+        
+        # Generate tags
+        tags = self.generate_tags(key_points)
+        if tags:
+            # Convert tags list to a comma-separated string for ChromaDB compatibility
+            metadata["tags"] = ",".join(tags)
+            print(f"6. Generated tags: {', '.join(tags)}")
+        
+        # Store based on memory type
+        if memory_type == "ephemeral":
+            # Store in ephemeral memory (in-memory only)
+            memory_id = str(uuid.uuid4())
+            self.ephemeral_memory.append({
+                "id": memory_id,
+                "text": key_points,
+                "metadata": metadata
+            })
+            print(f"7. Stored in ephemeral memory with ID: {memory_id}")
+            return memory_id
+            
+        elif memory_type == "short_term":
+            # Store in short-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                embedding = self.embed_model.encode(key_points).tolist()
+                
+                self.short_term_memory.add(
+                    ids=[memory_id],
+                    documents=[key_points],
+                    metadatas=[metadata],
+                    embeddings=[embedding]
+                )
+                
+                # Update FAISS index
+                self.update_faiss_indexes()
+                
+                print(f"7. Stored in short-term memory with ID: {memory_id}")
+                return memory_id
+            except Exception as e:
+                print(f"Error storing in short-term memory: {e}")
+                return None
+                
+        elif memory_type == "long_term":
+            # Store in long-term memory
+            try:
+                memory_id = str(uuid.uuid4())
+                embedding = self.embed_model.encode(key_points).tolist()
+                
+                self.long_term_memory.add(
+                    ids=[memory_id],
+                    documents=[key_points],
+                    metadatas=[metadata],
+                    embeddings=[embedding]
+                )
+                
+                # Update FAISS index
+                self.update_faiss_indexes()
+                
+                print(f"7. Stored in long-term memory with ID: {memory_id}")
+                return memory_id
+            except Exception as e:
+                print(f"Error storing in long-term memory: {e}")
+                return None
+        
+        return None
+
     def maintain_memory(self):
         """Perform maintenance tasks on memory stores"""
         print("\n=== MEMORY MAINTENANCE ===")
@@ -1065,276 +1537,6 @@ Message: {filtered_text}
         
         return unique_keywords
 
-    def search_relevant_context(self, query, max_results=3, force_retrieval=False):
-        """Search for relevant context based on the query"""
-        if not query or not isinstance(query, str):
-            return ""
-            
-        print(f"\n=== CONTEXT SEARCH ===")
-        print(f"1. Query: {query}")
-        
-        # Analyze query to determine if retrieval is needed
-        if not force_retrieval:
-            analysis = self.analyze_query(query)
-            if not analysis["retrieval_recommended"]:
-                print(f"2. Retrieval not recommended: {analysis['reason']}")
-                return ""
-        
-        # Extract entities from the query
-        query_entities = self.entity_tracker.find_entities_in_query(query)
-        
-        # Extract keywords for filtering
-        keywords = self.extract_keywords(query)
-        
-        print(f"2. Extracted keywords: {keywords}")
-        if query_entities:
-            print(f"3. Found {len(query_entities)} relevant entities in query:")
-            for entity in query_entities:
-                print(f"   - {entity['text']} ({entity['type']}): {entity['importance']:.2f}")
-        
-        # Prepare results container
-        all_results = []
-        
-        # Search in long-term memory
-        try:
-            # Generate query embedding
-            query_embedding = self.embed_model.encode([query])[0].tolist()
-            
-            # Search in long-term memory
-            results = self.long_term_memory.query(
-                query_embeddings=[query_embedding],
-                n_results=max_results
-            )
-            
-            if results and 'documents' in results and results['documents']:
-                for i, doc in enumerate(results['documents'][0]):
-                    metadata = results['metadatas'][0][i] if 'metadatas' in results and results['metadatas'][0] else {}
-                    
-                    # Calculate semantic similarity score
-                    semantic_score = self.semantic_similarity(query, doc)
-                    
-                    # Calculate keyword match score
-                    doc_keywords = self.extract_keywords(doc)
-                    keyword_matches = sum(1 for k in keywords if k in doc_keywords)
-                    keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
-                    
-                    # Calculate entity match score
-                    entity_score = 0.0
-                    if query_entities:
-                        # Check if any entities from the query appear in this document
-                        entity_matches = 0
-                        for entity in query_entities:
-                            if entity['text'].lower() in doc.lower():
-                                entity_matches += 1
-                        entity_score = min(1.0, entity_matches / len(query_entities))
-                    
-                    # Combined score (60% semantic, 20% keyword, 20% entity)
-                    combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
-                    
-                    if combined_score > 0.5:  # Only include if combined score is above threshold
-                        all_results.append((combined_score, doc, metadata, 
-                                          semantic_score, keyword_score, entity_score))
-        except Exception as e:
-            print(f"Error searching long-term memory: {e}")
-        
-        # Search in short-term memory
-        try:
-            # Search in short-term memory
-            results = self.short_term_memory.query(
-                query_embeddings=[query_embedding],
-                n_results=max_results
-            )
-            
-            if results and 'documents' in results and results['documents']:
-                for i, doc in enumerate(results['documents'][0]):
-                    metadata = results['metadatas'][0][i] if 'metadatas' in results and results['metadatas'][0] else {}
-                    
-                    # Calculate semantic similarity score
-                    semantic_score = self.semantic_similarity(query, doc)
-                    
-                    # Calculate keyword match score
-                    doc_keywords = self.extract_keywords(doc)
-                    keyword_matches = sum(1 for k in keywords if k in doc_keywords)
-                    keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
-                    
-                    # Calculate entity match score
-                    entity_score = 0.0
-                    if query_entities:
-                        # Check if any entities from the query appear in this document
-                        entity_matches = 0
-                        for entity in query_entities:
-                            if entity['text'].lower() in doc.lower():
-                                entity_matches += 1
-                        entity_score = min(1.0, entity_matches / len(query_entities))
-                    
-                    # Combined score (60% semantic, 20% keyword, 20% entity)
-                    combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
-                    
-                    if combined_score > 0.5:  # Only include if combined score is above threshold
-                        all_results.append((combined_score, doc, metadata, 
-                                          semantic_score, keyword_score, entity_score))
-        except Exception as e:
-            print(f"Error searching short-term memory: {e}")
-        
-        # Search in ephemeral memory
-        for memory in self.ephemeral_memory:
-            if 'text' in memory:
-                # Calculate semantic similarity score
-                semantic_score = self.semantic_similarity(query, memory['text'])
-                
-                # Calculate keyword match score
-                doc_keywords = self.extract_keywords(memory['text'])
-                keyword_matches = sum(1 for k in keywords if k in doc_keywords)
-                keyword_score = min(1.0, keyword_matches / max(1, len(keywords)))
-                
-                # Calculate entity match score
-                entity_score = 0.0
-                if query_entities:
-                    # Check if any entities from the query appear in this document
-                    entity_matches = 0
-                    for entity in query_entities:
-                        if entity['text'].lower() in memory['text'].lower():
-                            entity_matches += 1
-                    entity_score = min(1.0, entity_matches / len(query_entities))
-                
-                # Combined score (60% semantic, 20% keyword, 20% entity)
-                combined_score = (semantic_score * 0.6) + (keyword_score * 0.2) + (entity_score * 0.2)
-                
-                if combined_score > 0.5:  # Only include if combined score is above threshold
-                    all_results.append((combined_score, memory['text'], memory.get('metadata', {}), 
-                                      semantic_score, keyword_score, entity_score))
-        
-        if not all_results:
-            print("4. No relevant memories found")
-            return ""
-            
-        # Sort by combined score (highest first)
-        all_results.sort(reverse=True, key=lambda x: x[0])
-        
-        # Take top results
-        top_results = all_results[:max_results]
-        
-        print(f"4. Found {len(top_results)} relevant memories")
-        
-        # Format the results
-        formatted_results = []
-        for i, (combined_score, text, metadata, semantic_score, keyword_score, entity_score) in enumerate(top_results):
-            # Truncate long results
-            if len(text) > 300:
-                text = text[:297] + "..."
-            
-            # Add source information if available
-            source_info = ""
-            if metadata and 'source' in metadata:
-                source_info = f" (Source: {metadata['source']})"
-            
-            # Add score information
-            score_info = f"[Relevance: {combined_score:.2f}, Semantic: {semantic_score:.2f}, Keyword: {keyword_score:.2f}, Entity: {entity_score:.2f}]"
-            
-            formatted_results.append(f"Memory {i+1}{source_info}: {text}\n{score_info}\n")
-        
-        # Join the formatted results
-        result_text = "\n".join(formatted_results)
-        
-        print(f"5. Returning {len(formatted_results)} memories")
-        return result_text
-
-    def store_transcription(self, text, source="transcription", processed_text=None, role="user"):
-        """Store a transcription in the appropriate memory store
-        
-        Args:
-            text (str): The original transcription text
-            source (str): The source of the transcription
-            processed_text (str, optional): Processed version of the text (e.g., key points)
-            role (str): The role of the message sender ('user' or 'assistant')
-            
-        Returns:
-            bool: True if stored, False otherwise
-        """
-        if not text or not isinstance(text, str) or len(text.strip()) < 10:
-            print(f"Skipping transcription storage: Text too short or invalid")
-            return False
-            
-        print(f"\n=== TRANSCRIPTION STORAGE ===")
-        print(f"1. Processing transcription (length: {len(text.split())} words)")
-        
-        # Calculate importance based on the original transcription
-        importance = self.importance_score(text, role=role)
-        print(f"2. Importance score: {importance:.2f}")
-        
-        # Skip if below threshold
-        if importance < self.thresholds["storage_min"]:
-            print(f"3. Below storage threshold ({self.thresholds['storage_min']}), discarding")
-            return False
-        
-        # Use processed text if provided, otherwise use original
-        storage_text = processed_text if processed_text else text
-        
-        # Determine memory category based on importance
-        memory_type = self.categorize_memory(storage_text, importance, source_type=source)
-        print(f"4. Categorized as {memory_type} memory")
-        
-        # Generate metadata
-        metadata = {
-            "source": source,
-            "timestamp": time.time(),
-            "importance": importance,
-            "type": memory_type,
-            "role": role
-        }
-        
-        # Generate tags
-        tags = self.generate_tags(storage_text)
-        if tags:
-            # Convert tags list to a comma-separated string for ChromaDB compatibility
-            metadata["tags"] = ",".join(tags)
-            print(f"5. Generated tags: {', '.join(tags)}")
-        
-        # Store based on memory type
-        if memory_type == "ephemeral":
-            # Store in ephemeral memory (in-memory only)
-            memory_id = str(uuid.uuid4())
-            self.ephemeral_memory.append({
-                "id": memory_id,
-                "text": storage_text,
-                "metadata": metadata
-            })
-            print(f"6. Stored in ephemeral memory with ID: {memory_id}")
-            return True
-            
-        elif memory_type == "short_term":
-            # Store in short-term memory
-            try:
-                memory_id = str(uuid.uuid4())
-                self.short_term_memory.add(
-                    ids=[memory_id],
-                    documents=[storage_text],
-                    metadatas=[metadata]
-                )
-                print(f"6. Stored in short-term memory with ID: {memory_id}")
-                return True
-            except Exception as e:
-                print(f"Error storing in short-term memory: {e}")
-                return False
-                
-        elif memory_type == "long_term":
-            # Store in long-term memory
-            try:
-                memory_id = str(uuid.uuid4())
-                self.long_term_memory.add(
-                    ids=[memory_id],
-                    documents=[storage_text],
-                    metadatas=[metadata],
-                    embeddings=[self.embed_model.encode(storage_text).tolist()]
-                )
-                print(f"6. Stored in long-term memory with ID: {memory_id}")
-                return True
-            except Exception as e:
-                print(f"Error storing in long-term memory: {e}")
-                return False
-        
-        return False
-
     def analyze_query(self, query):
         """Analyze a query to determine if retrieval would be valuable.
         
@@ -1411,138 +1613,3 @@ Message: {filtered_text}
                 "has_personal_refs": has_personal_refs
             }
         }
-
-    def store_message(self, message, role, importance):
-        """Store a single message in the appropriate memory store
-        
-        Args:
-            message (str): The message text to store
-            role (str): The role of the message sender ('user' or 'assistant')
-            importance (float): The importance score of the message
-            
-        Returns:
-            str: The ID of the stored document, or None if not stored
-        """
-        if not message or not isinstance(message, str) or len(message) < 5:
-            print(f"Skipping storage: Message too short or invalid")
-            return None
-            
-        print(f"\n=== MESSAGE STORAGE ===")
-        print(f"1. Processing {role} message (length: {len(message.split())} words)")
-        
-        # Extract key points if the message is long enough
-        if len(message) > self.thresholds["key_points_min_length"]:
-            print(f"2. Extracting key points from message")
-            key_points = self.extract_key_points(message, source=role)
-            if key_points is None:
-                print("   No key insights found, using original")
-                key_points = message
-        else:
-            print(f"2. Message too short, using as is")
-            key_points = message
-        
-        # Check similarity with existing memories
-        all_memories = []
-        
-        # Get all memories from collections
-        try:
-            long_term_results = self.long_term_memory.get()
-            if long_term_results and 'documents' in long_term_results:
-                for doc in long_term_results['documents']:
-                    all_memories.append({"text": doc})
-                    
-            short_term_results = self.short_term_memory.get()
-            if short_term_results and 'documents' in short_term_results:
-                for doc in short_term_results['documents']:
-                    all_memories.append({"text": doc})
-        except Exception as e:
-            print(f"Error retrieving memories for similarity check: {e}")
-        
-        # Add ephemeral memories
-        all_memories.extend(self.ephemeral_memory)
-        
-        if all_memories:
-            highest_similarity = 0
-            similar_text = ""
-            
-            for memory in all_memories:
-                if 'text' not in memory:
-                    continue
-                    
-                similarity = self.semantic_similarity(key_points, memory['text'])
-                if similarity > highest_similarity:
-                    highest_similarity = similarity
-                    similar_text = memory['text']
-                
-                if similarity > self.thresholds["similarity_max"]:  # High similarity threshold
-                    print(f"3. Discarding due to high similarity ({similarity:.2f}) with existing memory")
-                    print(f"   Similar to: {similar_text[:50]}...")
-                    return None
-            
-            print(f"4. Highest similarity with existing memories: {highest_similarity:.2f}")
-        else:
-            print("4. No existing memories to compare with")
-        
-        # Determine memory category based on importance
-        memory_type = self.categorize_memory(key_points, importance, source_type=role)
-        print(f"5. Categorized as {memory_type} memory (importance: {importance:.2f})")
-        
-        # Generate metadata
-        metadata = {
-            "source": role,
-            "timestamp": time.time(),
-            "importance": importance,
-            "type": memory_type
-        }
-        
-        # Generate tags
-        tags = self.generate_tags(key_points)
-        if tags:
-            # Convert tags list to a comma-separated string for ChromaDB compatibility
-            metadata["tags"] = ",".join(tags)
-            print(f"6. Generated tags: {', '.join(tags)}")
-        
-        # Store based on memory type
-        if memory_type == "ephemeral":
-            # Store in ephemeral memory (in-memory only)
-            memory_id = str(uuid.uuid4())
-            self.ephemeral_memory.append({
-                "id": memory_id,
-                "text": key_points,
-                "metadata": metadata
-            })
-            print(f"7. Stored in ephemeral memory with ID: {memory_id}")
-            return memory_id
-            
-        elif memory_type == "short_term":
-            # Store in short-term memory
-            try:
-                memory_id = str(uuid.uuid4())
-                self.short_term_memory.add(
-                    ids=[memory_id],
-                    documents=[key_points],
-                    metadatas=[metadata]
-                )
-                print(f"7. Stored in short-term memory with ID: {memory_id}")
-                return memory_id
-            except Exception as e:
-                print(f"Error storing in short-term memory: {e}")
-                return None
-                
-        elif memory_type == "long_term":
-            # Store in long-term memory
-            try:
-                memory_id = str(uuid.uuid4())
-                self.long_term_memory.add(
-                    ids=[memory_id],
-                    documents=[key_points],
-                    metadatas=[metadata],
-                    embeddings=[self.embed_model.encode(key_points).tolist()]
-                )
-                print(f"7. Stored in long-term memory with ID: {memory_id}")
-                return memory_id
-            except Exception as e:
-                print(f"Error storing in long-term memory: {e}")
-                return None
-        
-        return None

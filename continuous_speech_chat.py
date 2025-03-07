@@ -43,7 +43,7 @@ except ImportError:
     print("RAG functionality not available - continuing without memory features")
 
 # Configuration
-LLM_API_URL = "http://localhost:11434/api/chat"  # Ollama API endpoint
+LLM_API_URL = "http://localhost:11434"  # Ollama API endpoint (base URL)
 LLM_MODEL = "mistral"  # Model to use
 VOICE = "af_heart"  # Kokoro TTS voice (af_heart, af_bella, etc.)
 LANG_CODE = "a"  # 'a' for American English, 'b' for British English
@@ -66,6 +66,9 @@ MAX_SENTENCE_LENGTH = 50  # Maximum words in a sentence before forcing a break
 AUDIO_CROSSFADE_MS = 200  # Milliseconds to crossfade between audio chunks
 TEXT_BUFFER_SIZE = 3  # Number of sentence chunks to accumulate before processing
 STORE_COMMANDS = ["store", "remember this", "save this"]  # Commands to trigger storage mode
+USER_TURN_START_SOUND = "audio_cues/listening_audio.wav"  # Replace with your file path
+USER_TURN_END_SOUND = "audio_cues/processing_audio.wav"      # Replace with your file path
+EXIT_COMMANDS = ["goodbye", "bye", "exit", "quit", "end conversation", "see you later"]  # Commands to exit the program
 
 # Create output directories
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -112,14 +115,29 @@ def get_cache_path(model_name, model_size=None):
     
     return os.path.join(CACHE_DIR, f"{cache_key}_{cache_hash}.cache")
 
-def get_relevant_context(query, max_results=3):
-    """Get relevant context from RAG handler if available"""
+def get_relevant_context(query, max_results=3, use_cache=True):
+    """Get relevant context from RAG handler if available
+    
+    Args:
+        query (str): The query to search for relevant context
+        max_results (int): Maximum number of results to return
+        use_cache (bool): Whether to use cached results
+        
+    Returns:
+        str or None: Relevant context as a formatted string, or None if no context found
+    """
     if not rag_available or rag_handler is None:
         return None
     
     try:
-        # Search for relevant context
-        context = rag_handler.search_relevant_context(query, max_results=max_results)
+        # Search for relevant context using the cached retrieval if enabled
+        if use_cache:
+            # This will use the LRU cache if available
+            context = rag_handler.search_relevant_context(query, max_results=max_results)
+        else:
+            # Force a new search without using cache
+            context = rag_handler._search_relevant_context_impl(query, max_results=max_results)
+            
         if context and isinstance(context, str) and len(context) > 0:
             # Format is already correct - just return it
             return context
@@ -219,27 +237,15 @@ def speak_storage_confirmation():
         print("🟢 STORAGE COMPLETE - Information stored successfully")
     
     try:
-        # Add to standard output pipeline to ensure visibility and consistent handling
+        # Add to standard output pipeline to ensure visibility
         text_chunk_queue.put(confirmation)
-        text_chunk_queue.join()  # Wait for processing
         
-        # Direct audio approach for immediate feedback
-        generator = pipeline(confirmation, voice=VOICE, speed=1.0)
+        # Wait for the audio to be processed and played
+        time.sleep(0.5)  # Short delay to ensure the text is queued
         
-        for _, _, audio in generator:
-            if hasattr(audio, 'detach'):
-                audio = audio.detach().cpu().numpy()
-            
-            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
-            
-            max_val = np.max(np.abs(audio))
-            if max_val > 1.0:
-                audio = audio / max_val
-            
-            sd.play(audio, TTS_SAMPLE_RATE)
-            sd.wait()
-            break
+        # Wait for audio queue to be empty before continuing
+        while not audio_queue.empty() or audio_playing.is_set():
+            time.sleep(0.1)
     
     except Exception as e:
         print(f"Error playing confirmation: {e}")
@@ -255,26 +261,18 @@ def speak_storage_prompt():
     
     try:
         # Add to standard output pipeline to ensure visibility
+        # This will route through the audio_generation_worker and audio_playback_thread
+        # instead of playing directly
         text_chunk_queue.put(prompt)
         
-        # Direct audio approach for immediate feedback
-        generator = pipeline(prompt, voice=VOICE, speed=1.0)
+        # Wait for the audio to be processed and played
+        # This ensures we don't continue until the prompt is spoken
+        time.sleep(0.5)  # Short delay to ensure the text is queued
         
-        for _, _, audio in generator:
-            if hasattr(audio, 'detach'):
-                audio = audio.detach().cpu().numpy()
+        # Wait for audio queue to be empty before continuing
+        while not audio_queue.empty() or audio_playing.is_set():
+            time.sleep(0.1)
             
-            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
-            
-            max_val = np.max(np.abs(audio))
-            if max_val > 1.0:
-                audio = audio / max_val
-            
-            sd.play(audio, TTS_SAMPLE_RATE)
-            sd.wait()
-            break
-    
     except Exception as e:
         print(f"Error playing storage prompt: {e}")
         traceback.print_exc()
@@ -364,6 +362,10 @@ def get_ollama_cache_key(model, messages):
 
 def is_sentence_boundary(text):
     """Determine if text ends at a natural sentence boundary"""
+    # Handle invalid input
+    if not text or not isinstance(text, str):
+        return False
+        
     # Strip trailing whitespace for accurate detection
     text = text.rstrip()
     
@@ -371,25 +373,51 @@ def is_sentence_boundary(text):
     if not text:
         return False
     
-    # Check for sentence-ending punctuation
-    if any(text.endswith(p) for p in ['.', '!', '?']):
+    # Check for sentence-ending punctuation with possible closing quotes/brackets
+    ending_chars = ['.', '!', '?', '."', '!"', '?"', '."', '!"', '?"', '.)', '!)', '?)', '.")', '!")', '?")']
+    if len(text.split()) >= 10 and any(text.endswith(p) for p in ending_chars):
+        return True
+    
+    # Check for dialog ending with quotes
+    if text.endswith('"') and text.count('"') % 2 == 0 and len(text) > 10:
         return True
         
     # Check for clause-ending punctuation in longer segments
-    if len(text.split()) >= 15 and any(text.endswith(p) for p in [':', ';', ',']):
+    if len(text.split()) >= 10 and any(text.endswith(p) for p in [':', ';', ',', '—', '–']):
         return True
     
     # Force break for very long text without punctuation
     if len(text.split()) >= MAX_SENTENCE_LENGTH:
         return True
         
+    # Check for common sentence-ending patterns
+    common_endings = [
+        " however", " nevertheless", " therefore", " thus", " hence", 
+        " accordingly", " consequently", " finally", " lastly"
+    ]
+    for ending in common_endings:
+        if text.lower().endswith(ending):
+            return True
+            
     return False
 
 def split_text_into_sentences(text):
     """Split text into natural sentences for better speech flow"""
+    if not text or not isinstance(text, str):
+        print("Warning: Invalid text passed to split_text_into_sentences")
+        return []
+        
+    # Clean the text first
+    text = text.strip()
+    if not text:
+        return []
+        
     sentences = []
     current_sentence = []
     words = text.split()
+    
+    if not words:
+        return [text]  # Return the original text if no words found
     
     # Process word by word
     for i, word in enumerate(words):
@@ -397,31 +425,38 @@ def split_text_into_sentences(text):
         current_text = " ".join(current_sentence)
         
         # If we have a sentence boundary, add it to our sentences list
-        if is_sentence_boundary(word) or i == len(words) - 1 or len(current_sentence) >= MAX_SENTENCE_LENGTH:
-            sentences.append(current_text)
+        if is_sentence_boundary(current_text) or i == len(words) - 1 or len(current_sentence) >= MAX_SENTENCE_LENGTH:
+            if current_text.strip():  # Only add non-empty sentences
+                sentences.append(current_text.strip())
             current_sentence = []
     
     # Add any remaining text
     if current_sentence:
-        sentences.append(" ".join(current_sentence))
+        remaining_text = " ".join(current_sentence).strip()
+        if remaining_text:  # Only add non-empty text
+            sentences.append(remaining_text)
+    
+    # Final check to ensure we have at least one sentence
+    if not sentences and text.strip():
+        sentences = [text.strip()]
         
+    # Debug info
+    print(f"Split text into {len(sentences)} sentences")
+    
     return sentences
 
 def stream_llm_response(messages):
     """Stream response from Ollama API with natural sentence chunking"""
     try:
-        # Check if we should augment with relevant context
+        # Start background retrieval if this is a user message
+        background_retrieval_thread = None
         if len(messages) >= 2 and messages[-1]['role'] == 'user':
             user_query = messages[-1]['content']
-            relevant_context = get_relevant_context(user_query)
             
-            if relevant_context:
-                # Add context to the system prompt temporarily for this request
-                augmented_messages = messages.copy()
-                system_content = augmented_messages[0]['content']
-                augmented_messages[0]['content'] = f"{system_content}\n\nRelevant context that may be helpful:\n{relevant_context}"
-                messages = augmented_messages
-                print(f"Added relevant context to the query")
+            # Start background retrieval
+            if rag_available and rag_handler is not None:
+                print("Starting background retrieval while generating response...")
+                background_retrieval_thread = rag_handler.start_background_retrieval(user_query)
         
         # Prepare the request
         payload = {
@@ -438,95 +473,147 @@ def stream_llm_response(messages):
         
         if cache_key in ollama_cache:
             cached_response, timestamp = ollama_cache[cache_key]
-            # Check if the cache is still valid
-            if current_time - timestamp < OLLAMA_CACHE_EXPIRY:
+            # Check if the cache is still valid and not empty
+            if current_time - timestamp < OLLAMA_CACHE_EXPIRY and cached_response and cached_response.strip():
                 print(f"Using cached LLM response (cached {int(current_time - timestamp)} seconds ago)")
+                print(f"Cached response: '{cached_response[:100]}...'")
                 
                 # Split cached response into natural sentences
                 sentences = split_text_into_sentences(cached_response)
                 
+                if not sentences:
+                    print("Warning: Cached response couldn't be split into sentences, using as is")
+                    sentences = [cached_response]
+                
+                print(f"Split into {len(sentences)} sentences for processing")
+                
                 # Add sentences to the text chunk queue for parallel processing
                 for sentence in sentences:
-                    text_chunk_queue.put(sentence)
-                    # Also yield sentence for tracking full response
-                    yield sentence
+                    if sentence and sentence.strip():
+                        text_chunk_queue.put(sentence.strip())
+                        # Also yield sentence for tracking full response
+                        yield sentence.strip()
                 
                 streaming_finished.set()
+                
+                # Check if background retrieval found anything
+                if background_retrieval_thread and rag_handler:
+                    relevant_context = rag_handler.get_background_retrieval_result(timeout=1.0)
+                    if relevant_context:
+                        print(f"Background retrieval found relevant context, but using cached response")
+                
                 return
+            else:
+                if not cached_response or not cached_response.strip():
+                    print("Cached response is empty, generating new response")
+                else:
+                    print(f"Cached response expired, generating new response")
         
         # For streaming response
         current_sentence = []
         full_response = []
         
-        with requests.post(LLM_API_URL, json=payload, stream=True, timeout=30) as response:
-            if response.status_code != 200:
-                print(f"Error from LLM API: {response.status_code}")
-                print(f"Error details: {response.text}")
-                error_msg = "Sorry, I couldn't generate a response at the moment."
-                text_chunk_queue.put(error_msg)
-                yield error_msg
-                streaming_finished.set()
-                return
+        # Make the streaming request
+        response = requests.post(
+            f"{LLM_API_URL}/api/chat",  # Correctly append the API endpoint path
+            json=payload,
+            stream=True,
+            timeout=60
+        )
+        
+        # Check for HTTP errors
+        if response.status_code != 200:
+            error_msg = f"Error from LLM API: HTTP {response.status_code}"
+            print(error_msg)
+            try:
+                error_details = response.text
+                print(f"Error details: {error_details}")
+            except:
+                pass
                 
-            for line in response.iter_lines():
-                if line:
-                    try:
-                        line_data = json.loads(line.decode('utf-8'))
-                        
-                        # Handle different streaming response formats
-                        if "message" in line_data:
-                            token = line_data.get("message", {}).get("content", "")
-                        elif "response" in line_data:
-                            token = line_data.get("response", "")
-                        else:
-                            token = ""
-                        
-                        if token:
-                            full_response.append(token)
-                            current_sentence.append(token)
-                            current_text = "".join(current_sentence)
-                            
-                            # Check if we've reached a sentence boundary
-                            if is_sentence_boundary(current_text):
-                                # Send this chunk for parallel processing
-                                sentence = current_text.strip()
-                                if sentence:  # Only process non-empty chunks
-                                    text_chunk_queue.put(sentence)
-                                    yield sentence
-                                current_sentence = []
+            # Return a fallback response
+            fallback_response = "I'm sorry, I'm having trouble connecting to my language model right now. Please try again in a moment."
+            text_chunk_queue.put(fallback_response)
+            yield fallback_response
+            streaming_finished.set()
+            return
+        
+        # Process the streaming response
+        for line in response.iter_lines():
+            if line:
+                try:
+                    # Parse the JSON line
+                    chunk = json.loads(line)
                     
-                    except json.JSONDecodeError:
-                        print(f"Failed to decode JSON: {line}")
-            
-            # Process any remaining text
-            final_text = "".join(current_sentence).strip()
-            if final_text:
-                text_chunk_queue.put(final_text)
-                yield final_text
+                    # Check if this is the done message
+                    if chunk.get("done", False):
+                        # Process any remaining text in current_sentence
+                        if current_sentence:
+                            final_text = "".join(current_sentence).strip()
+                            if final_text:
+                                text_chunk_queue.put(final_text)
+                                yield final_text
+                                full_response.append(final_text)
+                        break
+                    
+                    # Get the text chunk
+                    if "message" in chunk and "content" in chunk["message"]:
+                        text_chunk = chunk["message"]["content"]
+                        
+                        # Add to current sentence
+                        current_sentence.append(text_chunk)
+                        
+                        # Check if we have a sentence boundary
+                        text_so_far = "".join(current_sentence)
+                        
+                        if is_sentence_boundary(text_so_far):
+                            # We have a complete sentence, add it to the queue
+                            text_chunk_queue.put(text_so_far)
+                            # Also yield the sentence for tracking full response
+                            yield text_so_far
+                            full_response.append(text_so_far)
+                            # Reset current sentence
+                            current_sentence = []
+                            
+                except json.JSONDecodeError:
+                    print(f"Error decoding JSON: {line}")
+                    continue
+        
+        # Signal that streaming is finished
+        streaming_finished.set()
         
         # Cache the full response
         full_response_text = "".join(full_response)
-        ollama_cache[cache_key] = (full_response_text, current_time)
         
-        # Save the cache periodically
-        if len(ollama_cache) % 10 == 0:
-            try:
-                cache_path = get_cache_path("ollama_responses")
-                with open(cache_path, 'wb') as f:
-                    pickle.dump(ollama_cache, f)
-                print(f"Saved {len(ollama_cache)} responses to cache")
-            except Exception as e:
-                print(f"Error saving cache: {e}")
+        # Only cache non-empty responses
+        if full_response_text and full_response_text.strip():
+            print(f"Caching response: '{full_response_text[:100]}...'")
+            ollama_cache[cache_key] = (full_response_text, current_time)
+            
+            # Save the cache periodically
+            if len(ollama_cache) % 10 == 0:
+                try:
+                    cache_path = get_cache_path("ollama_responses")
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(ollama_cache, f)
+                    print(f"Saved {len(ollama_cache)} responses to cache")
+                except Exception as e:
+                    print(f"Error saving cache: {e}")
+        else:
+            print("Response is empty, not caching")
         
-        streaming_finished.set()
+        # Check if background retrieval found anything
+        if background_retrieval_thread and rag_handler:
+            relevant_context = rag_handler.get_background_retrieval_result(timeout=1.0)
+            if relevant_context:
+                print(f"Background retrieval found relevant context after response generation")
+                print(f"For future queries on this topic, context will be available immediately")
         
     except Exception as e:
-        print(f"Error in streaming LLM response: {e}")
+        print(f"Error in stream_llm_response: {e}")
         traceback.print_exc()
-        error_msg = "Sorry, there was an error connecting to the language model."
-        text_chunk_queue.put(error_msg)
-        yield error_msg
-        streaming_finished.set()
+        streaming_finished.set()  # Make sure to signal that streaming is finished
+        yield f"I encountered an error: {str(e)}"
 
 def audio_generation_worker():
     """Dedicated worker thread for converting text to speech"""
@@ -544,16 +631,18 @@ def audio_generation_worker():
                 break
             
             # Skip empty chunks
-            if not text_chunk.strip():
+            if not text_chunk or not isinstance(text_chunk, str) or not text_chunk.strip():
+                print("Skipping empty or invalid text chunk")
                 text_chunk_queue.task_done()
                 continue
                 
-            print(f"Generating audio for: {text_chunk}")
+            print(f"Generating audio for: '{text_chunk}'")
             
             # Generate speech for this chunk
             try:
                 generator = pipeline(text_chunk.strip(), voice=VOICE, speed=1.0)
                 
+                audio_generated = False
                 for _, _, audio in generator:
                     # Convert PyTorch Tensor to NumPy array if needed
                     if hasattr(audio, 'detach'):  # Check if it's a PyTorch Tensor
@@ -569,12 +658,16 @@ def audio_generation_worker():
                         audio = audio / max_val
                     
                     # Add to audio queue for playback
-                    print(f"Adding {len(audio)/TTS_SAMPLE_RATE:.2f}s audio to queue")
+                    print(f"Adding {len(audio)/TTS_SAMPLE_RATE:.2f}s audio to queue for: '{text_chunk[:30]}...'")
                     audio_queue.put(audio)
+                    audio_generated = True
                     break  # Just use the first chunk
+                
+                if not audio_generated:
+                    print(f"Warning: No audio generated for text: '{text_chunk}'")
             
             except Exception as e:
-                print(f"Error generating speech: {e}")
+                print(f"Error generating speech for '{text_chunk}': {e}")
                 traceback.print_exc()
             
             # Mark this text chunk as processed
@@ -583,14 +676,11 @@ def audio_generation_worker():
         except Exception as e:
             print(f"Error in audio generation worker: {e}")
             traceback.print_exc()
-            
-            # Make sure to mark the task as done even in case of error
+            # Continue processing other chunks
             try:
                 text_chunk_queue.task_done()
             except:
                 pass
-            
-            time.sleep(0.5)  # Wait before trying again
 
 def crossfade_audio(audio1, audio2, crossfade_samples):
     """Blend the end of audio1 with the beginning of audio2 using crossfade"""
@@ -679,29 +769,21 @@ def say_welcome_message():
     welcome_message = "Hello, I'm an AI assistant. How can I help you today?"
     print("Assistant: " + welcome_message)
     
-    # Generate and play welcome message
+    # Use the standard audio pipeline for consistency
     try:
-        generator = pipeline(welcome_message, voice=VOICE, speed=1.0)
+        # Add to text chunk queue for processing through the standard pipeline
+        text_chunk_queue.put(welcome_message)
         
-        for _, _, audio in generator:
-            # Convert PyTorch Tensor to NumPy array if needed
-            if hasattr(audio, 'detach'):  # Check if it's a PyTorch Tensor
-                audio = audio.detach().cpu().numpy()
+        # Wait for the audio to be processed and played
+        time.sleep(0.5)  # Short delay to ensure the text is queued
+        
+        # Wait for audio queue to be empty before continuing
+        while not audio_queue.empty() or audio_playing.is_set():
+            time.sleep(0.1)
             
-            # Ensure the data is float32
-            if isinstance(audio, np.ndarray) and audio.dtype != np.float32:
-                audio = audio.astype(np.float32)
+        # Play the user turn start cue to indicate it's the user's turn to speak
+        play_user_turn_start_cue()
             
-            # Normalize if needed
-            max_val = np.max(np.abs(audio))
-            if max_val > 1.0:
-                audio = audio / max_val
-            
-            # Play the welcome audio
-            sd.play(audio, TTS_SAMPLE_RATE)
-            sd.wait()  # Wait until audio has finished playing
-            break
-    
     except Exception as e:
         print(f"Error playing welcome message: {e}")
         traceback.print_exc()
@@ -763,109 +845,61 @@ def process_messages():
             # Add user message to conversation history
             print(f"Processing user message: '{message}'")
             
-            # Check if this is a storage command - more robust detection
+            # Check if this is an exit command
             message_lower = message.lower().strip()
-            is_storage_command = False
-            
-            # Check each storage command phrase
-            for cmd in STORE_COMMANDS:
-                if cmd in message_lower or message_lower.startswith(cmd) or message_lower.endswith(cmd):
-                    is_storage_command = True
-                    if DEBUG_STORAGE:
-                        print(f"🔍 Storage command detected: '{cmd}' in '{message_lower}'")
-                    break
-            
-            # Process storage command if detected and RAG is available
-            if is_storage_command and rag_available:
-                print("Storage command detected. Waiting for content to store...")
-                # Set flag to indicate we're waiting for content to store
-                waiting_for_storage.set()
-                # Set the storage start time for timeout monitoring
-                storage_start_time = time.time()
-                # Speak a prompt for what to store
-                speak_storage_prompt()
-                
-                # Explicitly unblock recording thread to ensure it can capture user's next input
-                text_chunk_queue.join()  # Wait for prompt to finish processing
-                audio_queue.join()      # Wait for all audio to be played
-                
-                # Clear the processing flag to allow recording again, but only after the prompt is played
-                # This ensures the system doesn't record its own prompt
-                print("Waiting for user to speak storage content...")
-                time.sleep(0.5)  # Small pause to ensure prompt is complete
-                is_processing.clear()
-                
-                # Signal recording state to ready
-                message_queue.task_done()
-                response_queue.put("ready_for_storage")  # Special signal
-                
-                # Skip the rest of the processing for this initial "store" command
-                continue
-            
-            # Normal message processing - add to conversation history
-            conversation_history.append({"role": "user", "content": message})
-            
-            # Special handling for common conversational phrases
-            simple_responses = {
-                "thank you": "You're welcome! Is there anything else I can help you with?",
-                "thanks": "You're welcome! Is there anything else I can help you with?",
-                "goodbye": "Goodbye! Have a great day.",
-                "bye": "Goodbye! Have a great day."
-            }
-            
-            # Check if message is a simple phrase that needs a direct response
-            message_lower = message.lower().strip().rstrip('.!?')
-            if message_lower in simple_responses and len(message.split()) <= 3:
-                # Use direct response for very simple messages
-                print(f"Using direct response for '{message}'")
-                direct_response = simple_responses[message_lower]
+            if any(cmd in message_lower for cmd in EXIT_COMMANDS):
+                print("Exit command detected")
+                # Generate a goodbye response
+                goodbye_message = "Goodbye! It was nice talking with you."
+                print("Assistant: " + goodbye_message)
                 
                 # Add to conversation history
-                conversation_history.append({"role": "assistant", "content": direct_response})
+                conversation_history.append({"role": "user", "content": message})
+                conversation_history.append({"role": "assistant", "content": goodbye_message})
                 
-                # Store interaction in memory if available
-                if rag_available and rag_handler is not None:
-                    try:
-                        rag_handler.store_interaction(message, direct_response)
-                    except Exception as e:
-                        print(f"Error storing interaction: {e}")
+                # Play the goodbye message
+                text_chunk_queue.put(goodbye_message)
                 
-                # Send directly to text chunk queue
-                text_chunk_queue.put(direct_response)
+                # Wait for audio to finish playing
+                print("Waiting for text processing to complete...")
+                text_chunk_queue.join()
                 
-                # Clear the processing flag after playback
-                text_chunk_queue.join()  # Wait for text processing
-                audio_queue.join()  # Wait for all audio to be played
-                is_processing.clear()
+                print("Waiting for audio playback to complete...")
+                audio_queue.join()
                 
-                # Put response in queue to signal completion
-                response_queue.put(direct_response)
-                
-                # If the user said goodbye or bye, signal the program to exit
-                if message_lower in ["goodbye", "bye"]:
-                    print("User said goodbye, will exit after response...")
-                    time.sleep(1)  # Give a moment for the goodbye to be heard
-                    exit_program.set()
-                
+                # Signal program to exit
+                exit_program.set()
+                response_queue.put(goodbye_message)
+                message_queue.task_done()
                 continue
             
-            # Reset streaming finished flag
-            streaming_finished.clear()
+            # Check if this is a storage command - more robust detection
+            if any(cmd in message_lower for cmd in STORE_COMMANDS):
+                print("Storage command detected")
+                # Set the storage mode flag
+                waiting_for_storage.set()
+                storage_start_time = time.time()
+                # Speak the storage prompt
+                speak_storage_prompt()
+                # Signal that we're ready for storage input
+                response_queue.put("ready_for_storage")
+                message_queue.task_done()
+                continue
             
-            # Get streaming response from LLM
+            # Add to conversation history
+            conversation_history.append({"role": "user", "content": message})
+            
+            # Set the processing flag to prevent new recordings
+            is_processing.set()
+            
+            # Play the user turn end cue to indicate the system is processing
+            play_user_turn_end_cue()
+            
+            # Start streaming response
             print("Starting streaming response...")
-            full_response = []
-            
-            # Collect the full response while pipeline processes in parallel
+            response_text = ""
             for text_chunk in stream_llm_response(conversation_history):
-                full_response.append(text_chunk)
-                # Note: stream_llm_response already adds chunks to text_chunk_queue
-            
-            # Wait for streaming to complete
-            streaming_finished.wait()
-            
-            # Combine all chunks for the full response
-            response_text = " ".join(full_response).strip()
+                response_text += text_chunk
             
             # Add assistant response to conversation history
             conversation_history.append({"role": "assistant", "content": response_text})
@@ -884,6 +918,9 @@ def process_messages():
             print("Waiting for audio playback to complete...")
             audio_queue.join()
             
+            # Play the user turn start cue to indicate it's the user's turn to speak
+            play_user_turn_start_cue()
+            
             # Clear the processing flag
             is_processing.clear()
             print("Processing complete")
@@ -898,7 +935,7 @@ def process_messages():
             response_queue.put("Sorry, I encountered an error processing your message.")
 
 def play_audio(audio_path):
-    """Play audio file using sounddevice"""
+    """Play audio file using the standard audio pipeline"""
     if audio_path and os.path.exists(audio_path):
         try:
             print("Playing audio response...")
@@ -911,9 +948,22 @@ def play_audio(audio_path):
             if max_val > 1.0:
                 audio_data = audio_data / max_val
             
-            # Play the audio
-            sd.play(audio_data, sample_rate)
-            sd.wait()  # Wait until audio has finished playing
+            # If sample rate doesn't match TTS_SAMPLE_RATE, we need to resample
+            if sample_rate != TTS_SAMPLE_RATE:
+                print(f"Resampling audio from {sample_rate}Hz to {TTS_SAMPLE_RATE}Hz")
+                # Simple resampling - for better quality, consider using librosa or scipy
+                audio_data = np.interp(
+                    np.linspace(0, len(audio_data), int(len(audio_data) * TTS_SAMPLE_RATE / sample_rate)),
+                    np.arange(len(audio_data)),
+                    audio_data
+                )
+            
+            # Add to audio queue for playback through the standard pipeline
+            audio_queue.put(audio_data)
+            
+            # Wait for audio to finish playing
+            while not audio_queue.empty() or audio_playing.is_set():
+                time.sleep(0.1)
             
             print("Audio playback complete")
                 
@@ -969,13 +1019,6 @@ def record_and_transcribe_continuously():
         print("\nInitializing audio recording...")
         p = pyaudio.PyAudio()
         
-        # Print available devices for debugging
-        print("\nAvailable audio devices:")
-        for i in range(p.get_device_count()):
-            dev_info = p.get_device_info_by_index(i)
-            print(f"Device {i}: {dev_info['name']}")
-            print(f"  Input channels: {dev_info['maxInputChannels']}")
-        
         # Open the stream
         stream = p.open(format=FORMAT,
                         channels=CHANNELS,
@@ -984,7 +1027,6 @@ def record_and_transcribe_continuously():
                         frames_per_buffer=CHUNK)
         
         print("🎤 Listening... (speak naturally, pause when you're done)")
-        print(f"Silence threshold: {SILENCE_THRESHOLD}, Duration: {SILENCE_DURATION}s")
         
         frames = []
         silent_chunks = 0
@@ -1114,6 +1156,9 @@ def record_and_transcribe_continuously():
                             # Set the processing flag to pause recording
                             is_processing.set()
                             
+                            # Play the user turn end cue to indicate the system is processing
+                            play_user_turn_end_cue()
+                            
                             # Save the recorded audio to a WAV file
                             audio_file = os.path.join(OUTPUT_DIR, "temp_user.wav")
                             wf = wave.open(audio_file, 'wb')
@@ -1214,6 +1259,68 @@ def record_and_transcribe_continuously():
                 p.terminate()
             except:
                 pass
+
+def play_user_turn_start_cue():
+    """Play an audio cue to indicate it's the user's turn to speak"""
+    try:
+        if os.path.exists(USER_TURN_START_SOUND):
+            print("Playing user turn start cue...")
+            # Load audio file
+            audio_data, sample_rate = sf.read(USER_TURN_START_SOUND, dtype='float32')
+            
+            # Normalize if needed
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 1.0:
+                audio_data = audio_data / max_val
+            
+            # Resample if needed to match TTS sample rate
+            if sample_rate != TTS_SAMPLE_RATE:
+                audio_data = np.interp(
+                    np.linspace(0, len(audio_data), int(len(audio_data) * TTS_SAMPLE_RATE / sample_rate)),
+                    np.arange(len(audio_data)),
+                    audio_data
+                )
+            
+            # Add to audio queue for playback through the standard pipeline
+            audio_queue.put(audio_data)
+            
+            # Only wait briefly to ensure audio starts playing
+            # This allows the function to return while audio is still playing
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"Error playing user turn start cue: {e}")
+        traceback.print_exc()
+
+def play_user_turn_end_cue():
+    """Play an audio cue to indicate the user's turn has ended"""
+    try:
+        if os.path.exists(USER_TURN_END_SOUND):
+            print("Playing user turn end cue...")
+            # Load audio file
+            audio_data, sample_rate = sf.read(USER_TURN_END_SOUND, dtype='float32')
+            
+            # Normalize if needed
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 1.0:
+                audio_data = audio_data / max_val
+            
+            # Resample if needed to match TTS sample rate
+            if sample_rate != TTS_SAMPLE_RATE:
+                audio_data = np.interp(
+                    np.linspace(0, len(audio_data), int(len(audio_data) * TTS_SAMPLE_RATE / sample_rate)),
+                    np.arange(len(audio_data)),
+                    audio_data
+                )
+            
+            # Add to audio queue for playback through the standard pipeline
+            audio_queue.put(audio_data)
+            
+            # Only wait briefly to ensure audio starts playing
+            # This allows the function to return while audio is still playing
+            time.sleep(0.1)
+    except Exception as e:
+        print(f"Error playing user turn end cue: {e}")
+        traceback.print_exc()
 
 def main():
     """Main function to run the continuous speech conversation"""

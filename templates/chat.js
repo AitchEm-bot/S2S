@@ -28,8 +28,11 @@ async function loadChatHistory() {
         // Clear existing messages
         chatMessages.innerHTML = '';
         
-        // Filter out messages with source="transcription"
-        const visibleMessages = data.history.filter(msg => !msg.source || msg.source !== 'transcription');
+        // Filter out system messages and messages with source="transcription"
+        const visibleMessages = data.history.filter(msg => 
+            (msg.role === "user" || msg.role === "assistant") && 
+            (!msg.source || msg.source !== 'transcription')
+        );
         
         if (visibleMessages.length === 0) {
             // Show welcome message if there are no visible messages

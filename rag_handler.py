@@ -1072,14 +1072,14 @@ Message: {filtered_text}
         try:
             print(f"Retrieving memories with tag: {tag}")
             
-            # Search in long-term memory
+            # Search in long-term memory - using $in operator instead of $contains
             long_term_results = self.long_term_memory.get(
-                where={"tags": {"$contains": tag}}
+                where={"tags": {"$in": [tag]}}
             )
             
-            # Search in short-term memory
+            # Search in short-term memory - using $in operator instead of $contains
             short_term_results = self.short_term_memory.get(
-                where={"tags": {"$contains": tag}}
+                where={"tags": {"$in": [tag]}}
             )
             
             # Combine results
@@ -1415,7 +1415,7 @@ Message: {filtered_text}
         # 3. Personal experience indicators (max 0.25)
         personal_indicators = {
             'i ': 0.02, 'me': 0.02, 'my': 0.02, 'mine': 0.02, 'myself': 0.02,
-            'we': 0.02, 'us': 0.02, 'our': 0.02, 'ours': 0.02, 'ourselves': 0.02,
+            'we': 0.02, 'our': 0.02, 'us': 0.02, 'ours': 0.02, 'ourselves': 0.02,
             'today': 0.03, 'yesterday': 0.03, 'tomorrow': 0.03,
             'think': 0.03, 'thought': 0.03, 'believe': 0.03,
             'want': 0.03, 'need': 0.03, 'hope': 0.03,

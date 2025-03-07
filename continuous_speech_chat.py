@@ -32,15 +32,35 @@ from pathlib import Path
 import io
 import sounddevice as sd
 import uuid
+import warnings
 
-# Import RAG handler
+# Suppress specific PyTorch warnings
+warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
+warnings.filterwarnings("ignore", message="`torch.nn.utils.weight_norm` is deprecated")
+
+# Monkey patch torch.nn.utils.weight_norm to use the new parametrizations version
 try:
-    from rag_handler import RAGHandler
-    rag_available = True
-    print("RAG functionality available")
+    import torch
+    from torch.nn.utils import weight_norm
+    
+    # Store the original function
+    original_weight_norm = weight_norm
+    
+    # Create a patched version that uses the new parametrizations
+    def patched_weight_norm(*args, **kwargs):
+        # Suppress the warning by using the new version if available
+        try:
+            from torch.nn.utils.parametrizations import weight_norm as new_weight_norm
+            return new_weight_norm(*args, **kwargs)
+        except ImportError:
+            # Fall back to the original if the new one isn't available
+            return original_weight_norm(*args, **kwargs)
+    
+    # Apply the patch
+    torch.nn.utils.weight_norm = patched_weight_norm
 except ImportError:
-    rag_available = False
-    print("RAG functionality not available - continuing without memory features")
+    # If torch isn't available, just continue
+    pass
 
 # Configuration
 LLM_API_URL = "http://localhost:11434"  # Ollama API endpoint (base URL)
@@ -86,7 +106,14 @@ waiting_for_storage = threading.Event()  # Flag to indicate we're waiting for co
 storage_start_time = None
 
 # Initialize RAG handler if available
-rag_handler = RAGHandler() if rag_available else None
+try:
+    from rag_handler import RAGHandler
+    rag_available = True
+    print("RAG functionality available")
+    rag_handler = RAGHandler()
+except ImportError:
+    rag_available = False
+    print("RAG functionality not available - continuing without memory features")
 
 # Pipeline queues for parallel processing
 text_chunk_queue = queue.Queue()  # Queue for text chunks from LLM
@@ -272,7 +299,7 @@ def speak_storage_prompt():
         # Wait for audio queue to be empty before continuing
         while not audio_queue.empty() or audio_playing.is_set():
             time.sleep(0.1)
-            
+    
     except Exception as e:
         print(f"Error playing storage prompt: {e}")
         traceback.print_exc()
@@ -305,7 +332,13 @@ def load_models():
     global pipeline, whisper_model
     
     print("Initializing Kokoro TTS pipeline...")
-    pipeline = KPipeline(lang_code=LANG_CODE)
+    # Initialize with custom parameters to avoid warnings
+    # Set num_layers=2 when dropout is used to avoid the warning
+    pipeline = KPipeline(
+        lang_code=LANG_CODE,
+        # Pass repo_id explicitly to avoid the warning
+        repo_id='hexgrad/Kokoro-82M'
+    )
     print("✅ Kokoro TTS initialized")
     
     # Check for cached Whisper model
@@ -398,7 +431,7 @@ def is_sentence_boundary(text):
     for ending in common_endings:
         if text.lower().endswith(ending):
             return True
-            
+        
     return False
 
 def split_text_into_sentences(text):
@@ -442,7 +475,7 @@ def split_text_into_sentences(text):
         
     # Debug info
     print(f"Split text into {len(sentences)} sentences")
-    
+        
     return sentences
 
 def stream_llm_response(messages):
@@ -491,7 +524,7 @@ def stream_llm_response(messages):
                 for sentence in sentences:
                     if sentence and sentence.strip():
                         text_chunk_queue.put(sentence.strip())
-                        # Also yield sentence for tracking full response
+                    # Also yield sentence for tracking full response
                         yield sentence.strip()
                 
                 streaming_finished.set()
@@ -537,7 +570,7 @@ def stream_llm_response(messages):
             yield fallback_response
             streaming_finished.set()
             return
-        
+                
         # Process the streaming response
         for line in response.iter_lines():
             if line:
@@ -574,7 +607,7 @@ def stream_llm_response(messages):
                             full_response.append(text_so_far)
                             # Reset current sentence
                             current_sentence = []
-                            
+                    
                 except json.JSONDecodeError:
                     print(f"Error decoding JSON: {line}")
                     continue
@@ -588,17 +621,17 @@ def stream_llm_response(messages):
         # Only cache non-empty responses
         if full_response_text and full_response_text.strip():
             print(f"Caching response: '{full_response_text[:100]}...'")
-            ollama_cache[cache_key] = (full_response_text, current_time)
-            
-            # Save the cache periodically
-            if len(ollama_cache) % 10 == 0:
-                try:
-                    cache_path = get_cache_path("ollama_responses")
-                    with open(cache_path, 'wb') as f:
-                        pickle.dump(ollama_cache, f)
-                    print(f"Saved {len(ollama_cache)} responses to cache")
-                except Exception as e:
-                    print(f"Error saving cache: {e}")
+        ollama_cache[cache_key] = (full_response_text, current_time)
+        
+        # Save the cache periodically
+        if len(ollama_cache) % 10 == 0:
+            try:
+                cache_path = get_cache_path("ollama_responses")
+                with open(cache_path, 'wb') as f:
+                    pickle.dump(ollama_cache, f)
+                print(f"Saved {len(ollama_cache)} responses to cache")
+            except Exception as e:
+                print(f"Error saving cache: {e}")
         else:
             print("Response is empty, not caching")
         
@@ -783,7 +816,7 @@ def say_welcome_message():
             
         # Play the user turn start cue to indicate it's the user's turn to speak
         play_user_turn_start_cue()
-            
+    
     except Exception as e:
         print(f"Error playing welcome message: {e}")
         traceback.print_exc()
@@ -1210,7 +1243,6 @@ def record_and_transcribe_continuously():
                                             print(f"Assistant: {response}")
                                     except queue.Empty:
                                         # If no signal is waiting, proceed to normal processing
-                                        # Wait for response to be processed before continuing
                                         print("Processing your message...")
                                         response = response_queue.get()  # This will block until a response is available
                                         print(f"Assistant: {response}")

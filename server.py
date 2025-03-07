@@ -34,16 +34,26 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Initialize the chat client
 ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-# ollama_model = os.environ.get("OLLAMA_MODEL", "deepseek-r1")
-ollama_model = os.environ.get("OLLAMA_MODEL", "Mistral")
+# Main conversation model
+ollama_model = os.environ.get("OLLAMA_MODEL", "deepseek-r1")
+# Smaller model for summarization tasks
+summarization_model = os.environ.get("SUMMARIZATION_MODEL", "mistral")
 
 # System prompt for the assistant
-system_prompt = """You are a helpful assistant that can answer questions and help with tasks. Your main role is to be a good listener and a problem solver for the user's emotions"""
+system_prompt = """You are a helpful assistant that answers questions and helps with tasks. 
+Your responses should:
+1. Be based only on the provided context and your training
+2. Clearly indicate when you're uncertain about information
+3. Avoid making up facts or speculating without evidence
+4. Request clarification when the query is ambiguous
+
+Do not say anything like "it seems you mentioned that..." or anything of the sort.
+Your role is to be a good listener and a problem solver for the user's emotions while maintaining factual accuracy."""
 
 # Options for the Ollama model
 model_options = {
-    "temperature": 0.56,
-    "top_p": 0.8,
+    "temperature": 0.3,
+    "top_p": 0.7,
     "num_ctx": 8192  # Increased context window for deepseek-r1
 }
 
@@ -223,22 +233,14 @@ def listen_audio():
     # Save the original transcription to a file
     save_text_to_file(f"transcriptions/{filename[:-4]}.txt", original_transcription)
     
-    # Process the transcription with Ollama to extract key points
-    # This simulates what would happen if we sent it to the LLM for processing
-    processed_transcription = original_transcription
+    # Process the transcription to extract key points
     try:
         # Ask Ollama to summarize or extract key points
-        summarize_prompt = f"""Please extract the key points from this transcription, 
-        preserving important details, emotions, and facts:
-        
-        {original_transcription}
-        
-        Extract only the most important information in a concise format.
-        """
+        summarize_prompt = "Extract the most important points from this transcription in bullet points:\n\n" + original_transcription + "\n\nRespond ONLY with bullet points of key information. No introductions or explanations needed."
         
         # Use a non-streaming request to get the processed version
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that extracts key information from transcriptions."},
+            {"role": "system", "content": "Extract only the essential information from text. Respond with concise bullet points only."},
             {"role": "user", "content": summarize_prompt}
         ]
         
@@ -246,26 +248,32 @@ def listen_audio():
         response = requests.post(
             f"{ollama_base_url}/api/chat",
             json={
-                "model": ollama_model,
+                "model": summarization_model,  # Use the smaller model for summarization
                 "messages": messages,
-                "stream": False
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # Lower temperature for more focused summaries
+                    "top_p": 0.9
+                }
             }
         )
         
         if response.status_code == 200:
             processed_transcription = response.json()["message"]["content"]
             print(f"Processed transcription: {processed_transcription}")
+        else:
+            print(f"Error from Ollama API: {response.status_code}")
+            processed_transcription = original_transcription
     except Exception as e:
         print(f"Error processing transcription: {str(e)}")
         # Fall back to original transcription if processing fails
         processed_transcription = original_transcription
-    
-    # Store the original transcription for importance evaluation, but save the processed version
-    stored = ollama_chat.rag.store_transcription(
+        
+    # Store the original transcription for importance evaluation
+    stored = ollama_chat.rag.store_message(
         original_transcription, 
-        source="audio",
-        processed_text=processed_transcription,
-        role="user"
+        "user",
+        0.7  # Use a fixed importance score for transcriptions
     )
     
     if stored:

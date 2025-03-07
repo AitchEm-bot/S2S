@@ -119,7 +119,7 @@ I'm providing you with some relevant information from previous conversations wit
 
 Incorporate this information naturally in your response without explicitly mentioning that it comes from memory or stored information. 
 Make your response feel like a natural continuation of the conversation, as if you simply remembered these details.
-If the information isn't relevant to the current query, you can ignore it.
+If the information isn't relevant to the current query, you can ignore it. Do not say anything like "it seems you mentioned that..." or "it looks like you're referrig to..." or anything of the sort.
 """
             else:
                 context_prompt = ""
@@ -133,7 +133,7 @@ I'm providing you with some relevant information for this conversation:
 
 Incorporate this information naturally in your response without explicitly mentioning that it comes from memory or stored information. 
 Make your response feel like a natural continuation of the conversation, as if you simply remembered these details.
-If the information isn't relevant to the current query, you can ignore it.
+If the information isn't relevant to the current query, you can ignore it. Do not say anything like "it seems you mentioned that..." or "it looks like you're referrig to..." or anything of the sort.
 """
             print(f"Using provided context: {len(context)} characters")
         
@@ -188,6 +188,8 @@ If the information isn't relevant to the current query, you can ignore it.
         else:
             # Get the full response at once
             response = self._chat(messages)
+            # Ensure we filter out any <think> blocks in non-streaming mode too
+            response = self._filter_response(response)
             yield response
         
         # Store the last response
@@ -208,12 +210,34 @@ If the information isn't relevant to the current query, you can ignore it.
         # Store the user message if important enough
         if message_importance > self.rag.thresholds['storage_min']:
             self.rag.store_message(message, "user", message_importance)
+
+    def _filter_response(self, response):
+        """Filter out <think> blocks from responses"""
+        # Handle complete <think></think> blocks
+        if "<think>" in response and "</think>" in response:
+            # Use regex to remove all <think>...</think> blocks
+            import re
+            filtered_response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+            # Clean up any leftover newlines that might be at the beginning
+            filtered_response = filtered_response.lstrip()
+            return filtered_response
+        
+        # Handle incomplete blocks - used when streaming and a block might be split across chunks
+        if "<think>" in response and "</think>" not in response:
+            # Remove everything from <think> to the end
+            import re
+            filtered_response = re.sub(r'<think>.*$', '', response, flags=re.DOTALL)
+            return filtered_response
             
-            # We no longer store assistant messages as requested
-            # Commenting out the storage code
-            # if response and len(response) > 50:  # Only store substantial responses
-            #     fixed_importance = 0.3  # Just above the storage threshold
-            #     self.rag.store_message(response, "assistant", fixed_importance)
+        if "</think>" in response and "<think>" not in response:
+            # Remove everything from the beginning to </think>
+            import re
+            filtered_response = re.sub(r'^.*?</think>', '', response, flags=re.DOTALL)
+            # Clean up any leftover newlines that might be at the beginning
+            filtered_response = filtered_response.lstrip()
+            return filtered_response
+            
+        return response
 
     def _chat(self, messages):
         """Send a chat request to Ollama API"""
@@ -229,7 +253,9 @@ If the information isn't relevant to the current query, you can ignore it.
                 timeout=60
             )
             response.raise_for_status()
-            return response.json()["message"]["content"]
+            content = response.json()["message"]["content"]
+            # Filter the response
+            return self._filter_response(content)
         except Exception as e:
             print(f"Error in chat: {e}")
             return f"I encountered an error: {str(e)}"
@@ -242,11 +268,8 @@ If the information isn't relevant to the current query, you can ignore it.
             self.last_response = ""
             print("Cleared immediate conversation context")
             
-            # Reinitialize the system prompt to ensure a fresh start
-            if self.system_prompt:
-                # Only add the system prompt if it's not empty
-                self.context = [{"role": "system", "content": self.system_prompt}]
-                print("Reinitialized system prompt")
+            # We no longer add the system prompt to the context
+            # It will be added separately in the chat method
             
             # Clear the RAG memory collections
             rag_result = self.rag.clear_collection()
@@ -305,30 +328,45 @@ If the information isn't relevant to the current query, you can ignore it.
             response.raise_for_status()
             
             full_response = ""
+            buffer = ""
+            
             for line in response.iter_lines():
                 if line:
                     try:
                         chunk_data = json.loads(line.decode('utf-8'))
                         if 'message' in chunk_data and 'content' in chunk_data['message']:
                             chunk = chunk_data['message']['content']
-                            full_response += chunk
-                            yield chunk
+                            buffer += chunk
+                            
+                            # Check if we have a think tag in the buffer
+                            if "<think>" in buffer or "</think>" in buffer:
+                                # Filter out any thinking blocks
+                                filtered_buffer = self._filter_response(buffer)
+                                # Calculate the new content to yield
+                                new_content = filtered_buffer[len(full_response):]
+                                if new_content:  # Only yield if there's new content
+                                    full_response = filtered_buffer
+                                    yield new_content
+                            else:
+                                # No think tags detected, just yield the chunk directly
+                                full_response += chunk
+                                yield chunk
                     except json.JSONDecodeError:
                         print(f"Error decoding JSON: {line}")
-                        
-            # Store the full response
+            
+            # Store the filtered full response
             self.last_response = full_response
-            return full_response
         except Exception as e:
-            error_msg = f"Error in streaming chat: {str(e)}"
-            print(error_msg)
+            print(f"Error in stream chat: {e}")
+            error_msg = f"I encountered an error: {str(e)}"
+            self.last_response = error_msg
             yield error_msg
             
     def get_last_response(self):
         """Get the last response from the assistant"""
         return self.last_response
 
-    def store_interaction(self, user_message, assistant_message):
+    def store_interaction(self, user_message):
         """Store both sides of an interaction if they're important enough"""
         # Calculate importance for user message only
         user_importance = self.importance_score(user_message)
@@ -336,9 +374,3 @@ If the information isn't relevant to the current query, you can ignore it.
         # Store user message if important enough
         if user_importance > self.thresholds['storage_min']:
             self.store_message(user_message, "user", user_importance)
-            
-            # We no longer store assistant messages as requested
-            # Commenting out the storage code
-            # if assistant_message and len(assistant_message) > 50:  # Only store substantial responses
-            #     fixed_importance = 0.3  # Just above the storage threshold
-            #     self.store_message(assistant_message, "assistant", fixed_importance)

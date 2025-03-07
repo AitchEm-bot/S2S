@@ -1,4 +1,17 @@
 import whisper
+import torch
+
+# Monkey patch torch.load to use weights_only=True by default for whisper
+original_torch_load = torch.load
+
+def patched_torch_load(*args, **kwargs):
+    # Set weights_only=True by default if not explicitly specified
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = True
+    return original_torch_load(*args, **kwargs)
+
+# Apply the monkey patch
+torch.load = patched_torch_load
 
 
 class handlers():

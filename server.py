@@ -15,7 +15,7 @@ import pickle
 
 # Import the optimized RAG system
 try:
-    from optimized_rag import optimize_rag_system
+    from optimized_rag import optimize_rag_system, OptimizedRAGHandler
     OPTIMIZED_RAG_AVAILABLE = True
     print("Optimized RAG system available")
 except ImportError:
@@ -830,6 +830,361 @@ def clear_cache():
         print(error_msg)
         traceback.print_exc()
         return jsonify({"status": "error", "message": error_msg}), 500
+
+@app.route("/debug/rag_status", methods=["GET"])
+def debug_rag_status():
+    """Debug endpoint to check the current state of the RAG system"""
+    try:
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Get basic info about the RAG system
+        rag_info = {
+            "type": type(rag).__name__,
+            "is_optimized": isinstance(rag, OptimizedRAGHandler) if 'OptimizedRAGHandler' in globals() else False,
+            "stored_entries": len(rag.stored_entries) if hasattr(rag, 'stored_entries') else "N/A",
+            "use_hybrid_search": rag.use_hybrid_search if hasattr(rag, 'use_hybrid_search') else False,
+            "summarize_after_retrieval": rag.summarize_after_retrieval if hasattr(rag, 'summarize_after_retrieval') else False,
+        }
+        
+        # Get info about the KNN index if available
+        knn_info = {}
+        if hasattr(rag, 'knn_index'):
+            knn_info = {
+                "ntotal": rag.knn_index.ntotal if hasattr(rag.knn_index, 'ntotal') else "N/A",
+                "dimension": rag.embedding_dimension if hasattr(rag, 'embedding_dimension') else "N/A",
+            }
+        
+        # Get info about the BM25 index if available
+        bm25_info = {}
+        if hasattr(rag, 'bm25') and rag.bm25 is not None:
+            bm25_info = {
+                "corpus_size": len(rag.bm25.corpus) if hasattr(rag.bm25, 'corpus') else "N/A",
+            }
+        
+        # Get sample entries if available
+        sample_entries = []
+        if hasattr(rag, 'stored_entries') and rag.stored_entries:
+            for i, entry in enumerate(rag.stored_entries[:5]):  # Get first 5 entries
+                if isinstance(entry, dict):
+                    sample_entries.append({
+                        "index": i,
+                        "text": entry["text"][:100] + "..." if len(entry["text"]) > 100 else entry["text"],
+                        "timestamp": entry.get("timestamp", "N/A"),
+                        "importance": entry.get("importance", "N/A"),
+                        "role": entry.get("role", "N/A"),
+                    })
+                else:
+                    sample_entries.append({
+                        "index": i,
+                        "text": entry[:100] + "..." if len(entry) > 100 else entry,
+                        "type": "string",
+                    })
+        
+        return jsonify({
+            "status": "success",
+            "rag_info": rag_info,
+            "knn_info": knn_info,
+            "bm25_info": bm25_info,
+            "sample_entries": sample_entries,
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route("/debug/memory_contents", methods=["GET"])
+def debug_memory_contents():
+    """Debug endpoint to check what's stored in memory"""
+    try:
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Get all entries
+        all_entries = []
+        if hasattr(rag, 'stored_entries') and rag.stored_entries:
+            for i, entry in enumerate(rag.stored_entries):
+                if isinstance(entry, dict):
+                    entry_info = {
+                        "index": i,
+                        "text": entry.get("text", "")[:200] + "..." if len(entry.get("text", "")) > 200 else entry.get("text", ""),
+                        "importance": entry.get("importance", "N/A"),
+                        "timestamp": entry.get("timestamp", "N/A"),
+                        "role": entry.get("role", "N/A"),
+                        "is_personal_info": False
+                    }
+                    
+                    # Check if this contains personal information
+                    if hasattr(rag, '_contains_personal_info') and rag._contains_personal_info(entry_info["text"]):
+                        entry_info["is_personal_info"] = True
+                    
+                    all_entries.append(entry_info)
+                else:
+                    entry_info = {
+                        "index": i,
+                        "text": entry[:200] + "..." if len(entry) > 200 else entry,
+                        "type": "string",
+                        "is_personal_info": False
+                    }
+                    
+                    # Check if this contains personal information
+                    if hasattr(rag, '_contains_personal_info') and rag._contains_personal_info(entry_info["text"]):
+                        entry_info["is_personal_info"] = True
+                    
+                    all_entries.append(entry_info)
+        
+        # Get personal information entries
+        personal_info_entries = [entry for entry in all_entries if entry.get("is_personal_info", False)]
+        
+        return jsonify({
+            "status": "success",
+            "total_entries": len(all_entries),
+            "personal_info_count": len(personal_info_entries),
+            "all_entries": all_entries,
+            "personal_info_entries": personal_info_entries
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route("/debug/test_query", methods=["POST"])
+def debug_test_query():
+    """Debug endpoint to test a query against the RAG system"""
+    try:
+        data = request.json
+        if not data or "query" not in data:
+            return jsonify({
+                "status": "error",
+                "message": "Missing query parameter"
+            }), 400
+        
+        query = data["query"]
+        max_results = data.get("max_results", 3)
+        
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Check if this is a personal info query
+        is_personal_query = False
+        if hasattr(rag, '_contains_personal_info'):
+            personal_patterns = [
+                r"what is my name",
+                r"who am i",
+                r"tell me my name",
+                r"my name",
+                r"where do i live",
+                r"my address",
+                r"what is my address",
+                r"where am i from",
+                r"what is my phone",
+                r"my email",
+                r"how old am i",
+                r"my age",
+                r"what do i do",
+                r"my job",
+                r"my occupation",
+                r"where do i work"
+            ]
+            
+            query_lower = query.lower()
+            for pattern in personal_patterns:
+                if re.search(pattern, query_lower):
+                    is_personal_query = True
+                    break
+        
+        # Get results from RAG
+        results = rag._search_relevant_context_impl(query, max_results=max_results)
+        
+        return jsonify({
+            "status": "success",
+            "query": query,
+            "is_personal_query": is_personal_query,
+            "results": results,
+            "results_length": len(results) if results else 0
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route("/api/store_memory", methods=["POST"])
+def api_store_memory():
+    """API endpoint to store information to memory"""
+    try:
+        data = request.json
+        if not data or "text" not in data:
+            return jsonify({
+                "status": "error",
+                "message": "Missing text parameter"
+            }), 400
+        
+        text = data["text"]
+        importance = data.get("importance", 0.7)
+        
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Check if this contains personal information and increase importance
+        contains_personal_info = False
+        if hasattr(rag, '_contains_personal_info') and rag._contains_personal_info(text):
+            importance = max(0.9, importance)  # Ensure high importance for personal info
+            contains_personal_info = True
+        
+        # Store the message
+        message_id = rag.store_message(text, role="user", importance=importance)
+        
+        if message_id:
+            return jsonify({
+                "status": "success",
+                "message": "Information stored successfully",
+                "message_id": message_id,
+                "contains_personal_info": contains_personal_info,
+                "importance": importance
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Failed to store information"
+            }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route("/debug/test_name_retrieval", methods=["GET"])
+def debug_test_name_retrieval():
+    """Debug endpoint to test the name retrieval functionality"""
+    try:
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Check if the find_name_in_memory function is available in continuous_speech_chat
+        try:
+            from continuous_speech_chat import find_name_in_memory
+            name_info = find_name_in_memory()
+            
+            if name_info:
+                return jsonify({
+                    "status": "success",
+                    "name_found": True,
+                    "name": name_info["name"],
+                    "entry": name_info["text"][:200] + "..." if len(name_info["text"]) > 200 else name_info["text"],
+                    "index": name_info["index"]
+                })
+            else:
+                # If no name found, check for any entries with name-related text
+                name_entries = []
+                if hasattr(rag, 'stored_entries'):
+                    for i, entry in enumerate(rag.stored_entries):
+                        if isinstance(entry, dict):
+                            text = entry.get("text", "")
+                        else:
+                            text = entry
+                            
+                        text_lower = text.lower()
+                        if "name" in text_lower or "call me" in text_lower:
+                            name_entries.append({
+                                "index": i,
+                                "text": text[:200] + "..." if len(text) > 200 else text
+                            })
+                
+                return jsonify({
+                    "status": "success",
+                    "name_found": False,
+                    "message": "No name information found",
+                    "name_related_entries": name_entries,
+                    "total_entries": len(rag.stored_entries) if hasattr(rag, 'stored_entries') else 0
+                })
+        except ImportError:
+            return jsonify({
+                "status": "error",
+                "message": "find_name_in_memory function not available"
+            }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route("/api/store_name", methods=["POST"])
+def api_store_name():
+    """API endpoint to store a name"""
+    try:
+        data = request.json
+        if not data or "name" not in data:
+            return jsonify({
+                "status": "error",
+                "message": "Missing name parameter"
+            }), 400
+        
+        name = data["name"]
+        
+        if not hasattr(ollama_chat, 'rag') or ollama_chat.rag is None:
+            return jsonify({
+                "status": "error",
+                "message": "RAG system not available"
+            }), 404
+        
+        rag = ollama_chat.rag
+        
+        # Create a message with the name information
+        message = f"My name is {name}."
+        
+        # Store with high importance
+        message_id = rag.store_message(message, role="user", importance=1.0)
+        
+        if message_id:
+            return jsonify({
+                "status": "success",
+                "message": f"Name '{name}' stored successfully",
+                "message_id": message_id
+            })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "Failed to store name"
+            }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     app.run(debug=True, port=9999, host="0.0.0.0")

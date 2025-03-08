@@ -34,6 +34,28 @@ import sounddevice as sd
 import uuid
 import warnings
 import re
+import logging
+
+# Configure logging (only if not already configured)
+logger = logging.getLogger("continuous_speech")
+if not logger.handlers:
+    # Create file handler
+    file_handler = logging.FileHandler("continuous_speech_debug.log")
+    file_handler.setLevel(logging.DEBUG)
+    
+    # Create console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.DEBUG)
 
 # Suppress specific PyTorch warnings
 warnings.filterwarnings("ignore", message="dropout option adds dropout after all but last recurrent layer")
@@ -162,44 +184,158 @@ def get_relevant_context(query, max_results=3, use_cache=True):
     Returns:
         str or None: Relevant context as a formatted string, or None if no context found
     """
+    logger.debug(f"Getting relevant context for query: '{query}', max_results={max_results}, use_cache={use_cache}")
+    
     if not rag_available or rag_handler is None:
+        logger.debug("RAG not available, returning None")
         return None
     
     try:
+        # Check if this is a query about personal information
+        is_personal_query = is_personal_info_query(query)
+        if is_personal_query:
+            logger.debug(f"Detected personal information query: '{query}'")
+            print(f"Looking for personal information related to: {query}")
+            
+            # For name-related queries, explicitly check for stored name information
+            if "name" in query.lower() or "call" in query.lower():
+                logger.debug("This is a name-related query, checking specifically for name information")
+                name_info = find_name_in_memory()
+                if name_info:
+                    logger.debug(f"Found name information: {name_info}")
+                    # Format name information in a clear way for the LLM
+                    formatted_name = f"Based on our previous conversation, your name is {name_info['name']}."
+                    return formatted_name
+        
         # Search for relevant context using the cached retrieval if enabled
         if use_cache:
             # This will use the LRU cache if available
+            logger.debug("Using cached search")
             context = rag_handler.search_relevant_context(query, max_results=max_results)
         else:
             # Force a new search without using cache
+            logger.debug("Forcing new search without cache")
             context = rag_handler._search_relevant_context_impl(query, max_results=max_results)
             
         if context and isinstance(context, str) and len(context) > 0:
             # Format is already correct - just return it
+            logger.debug(f"Found context (string format), length: {len(context)}")
+            logger.debug(f"Context preview: {context[:100]}...")
             return context
         elif context and isinstance(context, list) and len(context) > 0:
-            # Handle list format (older version compatibility)
-            context_items = []
-            for item in context:
-                if isinstance(item, tuple) and len(item) >= 2:
-                    # Handle tuple format (score, text)
-                    context_items.append(f"Reference: {item[1]}")
-                elif isinstance(item, str):
-                    # Handle string format
-                    context_items.append(f"Reference: {item}")
+            # Format the list as a string
+            logger.debug(f"Found context (list format), {len(context)} items")
+            formatted_context = "\n\n".join([f"{i+1}. {item}" for i, item in enumerate(context)])
+            logger.debug(f"Formatted context preview: {formatted_context[:100]}...")
+            return formatted_context
+        else:
+            logger.debug("No relevant context found")
             
-            if context_items:
-                return "\n\n".join(context_items)
-        
-        return None
+            # If this was a personal info query and no results were found, log it
+            if is_personal_query:
+                logger.warning(f"Personal information query but no results found: '{query}'")
+                print(f"No personal information found for query: {query}")
+                
+                # Check if we have any personal information stored at all
+                personal_info = find_personal_info_in_memory()
+                if personal_info:
+                    logger.debug(f"Found {len(personal_info)} personal info entries, but none matched the query")
+                else:
+                    logger.debug("No personal information found in memory")
+            
+            return None
     except Exception as e:
-        print(f"Error retrieving context: {e}")
-        traceback.print_exc()
+        logger.error(f"Error getting relevant context: {e}", exc_info=True)
+        print(f"Error getting relevant context: {e}")
         return None
+
+def is_personal_info_query(query):
+    """Check if a query is asking about personal information"""
+    query_lower = query.lower()
+    personal_query_patterns = [
+        r"what is my name",
+        r"who am i",
+        r"tell me my name",
+        r"my name",
+        r"where do i live",
+        r"my address",
+        r"what is my address",
+        r"where am i from",
+        r"what is my phone",
+        r"my email",
+        r"how old am i",
+        r"my age",
+        r"what do i do",
+        r"my job",
+        r"my occupation",
+        r"where do i work"
+    ]
+    
+    for pattern in personal_query_patterns:
+        if re.search(pattern, query_lower):
+            return True
+    return False
+
+def find_personal_info_in_memory():
+    """Find all personal information stored in memory"""
+    if not rag_available or rag_handler is None:
+        return []
+    
+    personal_info = []
+    try:
+        for i, entry in enumerate(rag_handler.stored_entries):
+            if isinstance(entry, dict):
+                text = entry.get("text", "")
+                if contains_personal_info(text):
+                    personal_info.append({
+                        "index": i,
+                        "text": text,
+                        "importance": entry.get("importance", 0.5),
+                        "is_personal_info": True
+                    })
+            else:
+                text = entry
+                if contains_personal_info(text):
+                    personal_info.append({
+                        "index": i,
+                        "text": text,
+                        "is_personal_info": True
+                    })
+        return personal_info
+    except Exception as e:
+        logger.error(f"Error finding personal info in memory: {e}", exc_info=True)
+        return []
+
+def contains_personal_info(text):
+    """Check if text contains personal information like names, addresses, etc."""
+    text_lower = text.lower()
+    personal_patterns = [
+        r"my name is",
+        r"i am [a-z]+ [a-z]+",  # Potential name pattern
+        r"call me",
+        r"i live",
+        r"my address",
+        r"my phone",
+        r"my email",
+        r"my birthday",
+        r"born on",
+        r"my age is",
+        r"i work at",
+        r"my job is",
+        r"my occupation"
+    ]
+    
+    for pattern in personal_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    return False
 
 def store_to_memory(text, importance=0.7):
     """Store text to memory using RAG handler"""
+    logger.debug(f"Storing to memory: importance={importance}, text_preview='{text[:50]}...'")
+    
     if not rag_available or rag_handler is None:
+        logger.debug("Memory storage not available - skipping")
         print("Memory storage not available - skipping")
         return False
     
@@ -213,55 +349,37 @@ def store_to_memory(text, importance=0.7):
         # Make sure the text is in a good format for storage
         cleaned_text = text.strip()
         if not cleaned_text or len(cleaned_text) < 3:
+            logger.debug("Text too short or empty - skipping storage")
             print("Text too short or empty - skipping storage")
             return False
+        
+        # Check if this contains personal information and increase importance
+        if contains_personal_info(cleaned_text):
+            importance = max(0.9, importance)  # Ensure high importance for personal info
+            logger.debug(f"Detected personal information, increased importance to {importance}")
+            print(f"Detected personal information, storing with high importance")
             
         # Try to store message using the RAG handler
         try:
-            rag_handler.store_message(cleaned_text, role="user", importance=importance)
-            if DEBUG_STORAGE:
-                print("✅ Memory storage successful")
-            return True
-        except Exception as e:
-            print(f"Error using store_message, trying alternate method: {e}")
-            # Fallback to direct storage method
-            try:
-                # Get embedding for the text
-                embedding = rag_handler.embed_model.encode(cleaned_text)
-                
-                # Create metadata
-                metadata = {
-                    "source": "user_input",
-                    "timestamp": time.time(),
-                    "importance": importance
-                }
-                
-                # Generate a unique ID
-                doc_id = str(uuid.uuid4())
-                
-                # Choose memory store based on importance
-                memory_store = rag_handler.short_term_memory
-                if importance > 0.7:  # High importance goes to long-term
-                    memory_store = rag_handler.long_term_memory
-                
-                # Store directly in memory
-                memory_store.add(
-                    documents=[cleaned_text],
-                    embeddings=[embedding.tolist()],
-                    metadatas=[metadata],
-                    ids=[doc_id]
-                )
-                
+            logger.debug("Calling rag_handler.store_message")
+            result = rag_handler.store_message(cleaned_text, role="user", importance=importance)
+            
+            if result:
+                logger.debug(f"Memory storage successful, message_id: {result}")
                 if DEBUG_STORAGE:
-                    print("✅ Memory storage successful (using fallback method)")
+                    print("✅ Memory storage successful")
                 return True
-            except Exception as e2:
-                print(f"Error storing to memory (fallback failed): {e2}")
-                traceback.print_exc()
+            else:
+                logger.warning("Memory storage failed (no result returned)")
+                print("❌ Memory storage failed")
                 return False
+        except Exception as e:
+            logger.error(f"Error storing message: {e}", exc_info=True)
+            print(f"❌ Error storing message: {e}")
+            return False
     except Exception as e:
+        logger.error(f"Error in store_to_memory: {e}", exc_info=True)
         print(f"Error storing to memory: {e}")
-        traceback.print_exc()
         return False
 
 def speak_storage_confirmation():
@@ -1610,6 +1728,91 @@ def seed_cache_with_common_phrases():
     # Save the seeded cache
     save_ollama_cache()
     print(f"Cache seeded with {len(common_phrases)} common phrases")
+
+def find_name_in_memory():
+    """Specifically search for name information in memory"""
+    logger.debug("Searching specifically for name information in memory")
+    
+    if not rag_available or rag_handler is None:
+        return None
+    
+    try:
+        for i, entry in enumerate(rag_handler.stored_entries):
+            if isinstance(entry, dict):
+                text = entry.get("text", "")
+            else:
+                text = entry
+                
+            text_lower = text.lower()
+            
+            # Look for specific name patterns
+            name_patterns = [
+                r"my name is (\w+)",
+                r"call me (\w+)",
+                r"i am (\w+)",
+                r"i'm (\w+)"
+            ]
+            
+            for pattern in name_patterns:
+                match = re.search(pattern, text_lower)
+                if match:
+                    name = match.group(1)
+                    logger.debug(f"Found name '{name}' in entry: {text[:50]}...")
+                    return {
+                        "index": i,
+                        "text": text,
+                        "name": name.capitalize()
+                    }
+        
+        logger.debug("No name information found in memory")
+        return None
+    except Exception as e:
+        logger.error(f"Error finding name in memory: {e}", exc_info=True)
+        return None
+
+def enhance_prompt_with_personal_info(messages, query):
+    """Enhance the prompt with personal information if available
+    
+    Args:
+        messages (list): The messages to be sent to the LLM
+        query (str): The user's query
+        
+    Returns:
+        bool: True if the prompt was enhanced, False otherwise
+    """
+    if not rag_available or rag_handler is None:
+        return False
+        
+    try:
+        query_lower = query.lower()
+        
+        # Check if this is a name-related query
+        if "name" in query_lower or "call" in query_lower or "who am i" in query_lower:
+            logger.debug("This is a name-related query, checking specifically for name information")
+            name_info = find_name_in_memory()
+            if name_info:
+                logger.debug(f"Found name information: {name_info}")
+                # Format name information in a clear way for the LLM
+                formatted_name = f"Based on previous conversations, the user's name is {name_info['name']}. Make sure to use this name when addressing the user."
+                
+                # Add to system message
+                if len(messages) > 0 and messages[0]["role"] == "system":
+                    messages[0]["content"] = f"{messages[0]['content']}\n\nImportant user information:\n{formatted_name}"
+                else:
+                    # Insert a new system message at the beginning
+                    messages.insert(0, {"role": "system", "content": formatted_name})
+                
+                logger.debug("Added name information to system message")
+                print(f"Using name information from memory: {formatted_name}")
+                return True
+                
+        # Check for other personal information types if needed
+        # (address, job, etc.)
+        
+        return False
+    except Exception as e:
+        logger.error(f"Error enhancing prompt with personal info: {e}", exc_info=True)
+        return False
 
 def main():
     """Main function to run the continuous speech conversation"""

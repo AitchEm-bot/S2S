@@ -228,6 +228,10 @@ def load_home_page():
 def chat_page():
     return render_template("chat.html")
 
+@app.route("/speech")
+def speech_page():
+    return render_template("speech.html")
+
 @app.route("/<path:filename>")
 def serve_static(filename):
     """Serve static files from the templates directory"""

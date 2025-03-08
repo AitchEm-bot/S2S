@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Speech Interface</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        /* Ensure navbar is clickable */
+        .tab-container {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000; /* Higher z-index to ensure it's above other elements */
+            pointer-events: auto; /* Explicitly enable pointer events */
+        }
+        
+        /* Make sure canvas doesn't block interaction */
+        #canvas-container {
+            pointer-events: none; /* Allow clicks to pass through */
+        }
+        
+        /* Only enable pointer events on the canvas itself */
+        #visualizer {
+            pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+    <div id="background"></div>
+    <nav class="tab-container">
+        <button class="tab" onclick="location.href='/'">Record</button>
+        <button class="tab" onclick="location.href='/chat'">Chat</button>
+        <button class="tab active" onclick="location.href='/speech'">Speech</button>
+    </nav>
+    <main class="content">
+        <div id="canvas-container">
+            <canvas id="visualizer"></canvas>
+        </div>
+        <div id="status-text"></div>
+        <div id="debug-info"></div>
+    </main>
+    <footer>
+        <p>Mindful Journal & Chat © 2025 | Nurture your thoughts, cultivate peace</p>
+    </footer>
+    
+    <script src="speech.js"></script>
+</body>
+</html>

@@ -111,7 +111,15 @@ try:
     from rag_handler import RAGHandler
     rag_available = True
     print("RAG functionality available")
-    rag_handler = RAGHandler()
+    
+    # Try to import the optimized RAG system
+    try:
+        from optimized_rag import OptimizedRAGHandler
+        print("Using optimized RAG system with improvements from updates.md")
+        rag_handler = OptimizedRAGHandler()
+    except ImportError:
+        print("Optimized RAG not available, using standard RAG")
+        rag_handler = RAGHandler()
 except ImportError:
     rag_available = False
     print("RAG functionality not available - continuing without memory features")

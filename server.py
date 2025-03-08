@@ -13,6 +13,15 @@ import uuid
 import hashlib
 import pickle
 
+# Import the optimized RAG system
+try:
+    from optimized_rag import optimize_rag_system
+    OPTIMIZED_RAG_AVAILABLE = True
+    print("Optimized RAG system available")
+except ImportError:
+    OPTIMIZED_RAG_AVAILABLE = False
+    print("Optimized RAG system not available - install rank_bm25 package")
+
 save_text_to_file = handlers.save_text_to_file
 transcribe_audio = handlers.transcribe_audio
 app = Flask(__name__, static_folder='static', template_folder='templates')
@@ -83,6 +92,15 @@ if is_reloader:
         options=model_options,
         rag_config=rag_config
     )
+    
+    # Optimize the RAG system if available
+    if OPTIMIZED_RAG_AVAILABLE:
+        try:
+            optimize_rag_system(ollama_chat)
+            print("RAG system optimized with improvements from updates.md")
+        except Exception as e:
+            print(f"Error optimizing RAG system: {e}")
+            traceback.print_exc()
 else:
     print("Reloader process: Initializing RAG without maintenance")
     # Create a modified config that disables maintenance
@@ -96,6 +114,15 @@ else:
         options=model_options,
         rag_config=no_maintenance_config
     )
+    
+    # Optimize the RAG system if available
+    if OPTIMIZED_RAG_AVAILABLE:
+        try:
+            optimize_rag_system(ollama_chat)
+            print("RAG system optimized with improvements from updates.md")
+        except Exception as e:
+            print(f"Error optimizing RAG system: {e}")
+            traceback.print_exc()
 
 # Load cache on startup
 def load_ollama_cache():
